@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_DB: pgline
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d pgline"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGLINE_TEST_URL: postgresql://postgres:postgres@localhost:5432/pgline?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test
+      # The mixed-host fallback test requires a real Unix socket path, which
+      # a GitHub Actions TCP service container does not expose.
+      - run: cargo test -- --ignored --test-threads=1 --skip mixed_hosts_fall_back_from_tcp_to_unix_socket
+      - run: cargo build --release
