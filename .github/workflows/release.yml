@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14-arm64
+            target: aarch64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          archive="pgline-${VERSION#v}-${TARGET}"
+          mkdir "$archive"
+          cp target/release/pgline README.md "$archive/"
+          tar -czf "$archive.tar.gz" "$archive"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pgline-${{ matrix.target }}
+          path: pgline-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pgline-*
+          merge-multiple: true
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tar.gz --clobber
+          else
+            gh release create "$TAG" dist/*.tar.gz --verify-tag --generate-notes --title "$TAG"
+          fi
+
+  update-homebrew:
+    name: Update Homebrew tap
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pgline-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/checkout@v4
+        with:
+          repository: woohp/homebrew-tap
+          ref: master
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Update formula
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          macos_arm_sha="$(sha256sum "dist/pgline-${version}-aarch64-apple-darwin.tar.gz" | cut -d' ' -f1)"
+          linux_x86_sha="$(sha256sum "dist/pgline-${version}-x86_64-unknown-linux-gnu.tar.gz" | cut -d' ' -f1)"
+          mkdir -p homebrew-tap/Formula
+          cat > homebrew-tap/Formula/pgline.rb <<EOF
+          class Pgline < Formula
+            desc "Fast, interactive PostgreSQL client"
+            homepage "https://github.com/woohp/pgline"
+            version "${version}"
+
+            on_macos do
+              depends_on arch: :arm64
+              url "https://github.com/woohp/pgline/releases/download/v${version}/pgline-${version}-aarch64-apple-darwin.tar.gz"
+              sha256 "${macos_arm_sha}"
+            end
+
+            on_linux do
+              depends_on arch: :x86_64
+              url "https://github.com/woohp/pgline/releases/download/v${version}/pgline-${version}-x86_64-unknown-linux-gnu.tar.gz"
+              sha256 "${linux_x86_sha}"
+            end
+
+            def install
+              bin.install "pgline"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/pgline --version")
+            end
+          end
+          EOF
+      - name: Commit formula
+        working-directory: homebrew-tap
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/pgline.rb
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m "pgline ${VERSION#v}"
+          git push
