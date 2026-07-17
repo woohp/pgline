@@ -34,19 +34,52 @@ jobs:
           VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          archive="pgline-${VERSION#v}-${TARGET}"
-          mkdir "$archive"
-          cp target/release/pgline README.md "$archive/"
-          tar -czf "$archive.tar.gz" "$archive"
+          archive="pgline-${VERSION#v}-${TARGET}.tar.gz"
+          tar -czf "$archive" -C target/release pgline
+          if [[ "$TARGET" == "x86_64-unknown-linux-gnu" ]]; then
+            cp "$archive" "pgline-${TARGET}.tar.gz"
+          fi
       - uses: actions/upload-artifact@v5
         with:
           name: pgline-${{ matrix.target }}
           path: pgline-*.tar.gz
           if-no-files-found: error
 
+  build-arch-package:
+    name: Build Arch Linux package
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: pgline-x86_64-unknown-linux-gnu
+          path: dist
+      - name: Build package
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${VERSION#v}"
+          mkdir arch-package
+          tar -xzf "dist/pgline-x86_64-unknown-linux-gnu.tar.gz" -C arch-package
+          cp packaging/arch/PKGBUILD arch-package/
+          sed -i "s/^pkgver=.*/pkgver=${version}/" arch-package/PKGBUILD
+          docker run --rm -v "$PWD/arch-package:/work" -w /work archlinux:base-devel \
+            bash -c 'useradd -m builder && chown -R builder:builder /work && su builder -c "makepkg --noconfirm"'
+          cp "arch-package/pgline-${version}-1-x86_64.pkg.tar.zst" \
+            "pgline-x86_64.pkg.tar.zst"
+      - uses: actions/upload-artifact@v5
+        with:
+          name: pgline-arch-package
+          path: |
+            arch-package/pgline-*.pkg.tar.zst
+            pgline-x86_64.pkg.tar.zst
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub release
-    needs: build
+    needs: [build, build-arch-package]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
@@ -61,10 +94,11 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          mapfile -d '' assets < <(find dist -type f -print0)
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/*.tar.gz --clobber
+            gh release upload "$TAG" "${assets[@]}" --clobber
           else
-            gh release create "$TAG" dist/*.tar.gz --verify-tag --generate-notes --title "$TAG"
+            gh release create "$TAG" "${assets[@]}" --verify-tag --generate-notes --title "$TAG"
           fi
 
   update-homebrew:

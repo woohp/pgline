@@ -1,0 +1,15 @@
+pkgname=pgline
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Fast, interactive PostgreSQL client"
+arch=('x86_64')
+url="https://github.com/woohp/pgline"
+license=('MIT')
+depends=('glibc' 'gcc-libs')
+options=('!debug')
+source=('pgline')
+sha256sums=('SKIP')
+
+package() {
+  install -Dm755 "$srcdir/pgline" "$pkgdir/usr/bin/pgline"
+}

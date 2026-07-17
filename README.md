@@ -4,6 +4,38 @@ A PostgreSQL REPL
 
 ## Install
 
+### Arch Linux
+
+Install the latest release as a pacman-managed package:
+
+```sh
+curl -fL https://github.com/woohp/pgline/releases/latest/download/pgline-x86_64.pkg.tar.zst -o /tmp/pgline.pkg.tar.zst && sudo pacman -U /tmp/pgline.pkg.tar.zst
+```
+
+Downloading first also works on Arch derivatives that require signatures for packages fetched directly by pacman.
+
+Alternatively, install the prebuilt Linux binary directly:
+
+```sh
+curl -fsSL https://github.com/woohp/pgline/releases/latest/download/pgline-x86_64-unknown-linux-gnu.tar.gz | sudo tar -xz -C /usr/local/bin pgline
+```
+
+Ansible equivalent:
+
+```yaml
+- name: Install pgline
+  become: true
+  ansible.builtin.unarchive:
+    src: https://github.com/woohp/pgline/releases/latest/download/pgline-x86_64-unknown-linux-gnu.tar.gz
+    dest: /usr/local/bin
+    remote_src: true
+    include:
+      - pgline
+    mode: "0755"
+```
+
+### From source
+
 ```sh
 cargo build --release
 ```
