@@ -8,7 +8,7 @@ use crate::{
     cli::OutputFormat,
     connection::CancellationTls,
     error::{AppError, Result},
-    output::{self, ResultSet, RetentionBudget},
+    output::{self, BoundedBuffer, ResultSet, RetentionBudget},
 };
 
 #[derive(Clone, Copy)]
@@ -95,7 +95,7 @@ struct ExecutionState<'a> {
     /// Reset for each result set, so one statement's rows cannot starve a later
     /// statement in the same batch.
     retention_budget: RetentionBudget,
-    rendered: String,
+    batch: BoundedBuffer,
     diagnostics: Vec<String>,
     completed_statements: usize,
     query_error: Option<tokio_postgres::Error>,
@@ -103,7 +103,6 @@ struct ExecutionState<'a> {
     stream_machine: bool,
     delimiter: char,
     terminal: bool,
-    batch_output_limited: bool,
 }
 
 impl<'a> ExecutionState<'a> {
@@ -127,7 +126,7 @@ impl<'a> ExecutionState<'a> {
             tls,
             current_result: ResultSet::default(),
             retention_budget: RetentionBudget::for_human_result(),
-            rendered: String::new(),
+            batch: BoundedBuffer::new(output::MAX_INTERACTIVE_BATCH_BYTES, ""),
             diagnostics: Vec::new(),
             completed_statements: 0,
             query_error: None,
@@ -135,7 +134,6 @@ impl<'a> ExecutionState<'a> {
             stream_machine,
             delimiter,
             terminal: std::io::stdout().is_terminal(),
-            batch_output_limited: false,
         }
     }
 
@@ -234,13 +232,10 @@ impl<'a> ExecutionState<'a> {
                     .await?;
             }
         } else {
-            append_bounded_batch_output(
-                &mut self.rendered,
-                &rendered.data,
-                &mut self.diagnostics,
-                &mut self.batch_output_limited,
-                output::MAX_INTERACTIVE_BATCH_BYTES,
-            );
+            if !self.batch.is_limited() && !self.batch.push(&rendered.data) {
+                self.diagnostics
+                    .push("interactive batch output limited; additional results omitted".into());
+            }
             if let Some(diagnostic) = rendered.diagnostic {
                 self.diagnostics.push(diagnostic);
             }
@@ -278,29 +273,11 @@ impl<'a> ExecutionState<'a> {
 
     fn finish(self) -> Execution {
         Execution {
-            output: self.rendered,
+            output: self.batch.finish(),
             diagnostics: self.diagnostics,
             completed_statements: self.completed_statements,
             error: self.query_error,
         }
-    }
-}
-
-fn append_bounded_batch_output(
-    rendered: &mut String,
-    output: &str,
-    diagnostics: &mut Vec<String>,
-    limited: &mut bool,
-    limit: usize,
-) {
-    if *limited {
-        return;
-    }
-    if rendered.len().saturating_add(output.len()) <= limit {
-        rendered.push_str(output);
-    } else {
-        diagnostics.push("interactive batch output limited; additional results omitted".into());
-        *limited = true;
     }
 }
 
@@ -453,23 +430,6 @@ mod tests {
             row_limit: 100,
             max_field_width,
         }
-    }
-
-    #[test]
-    fn interactive_batch_limit_omits_a_suffix() {
-        let mut rendered = String::new();
-        let mut diagnostics = Vec::new();
-        let mut limited = false;
-        append_bounded_batch_output(
-            &mut rendered,
-            "oversized",
-            &mut diagnostics,
-            &mut limited,
-            4,
-        );
-        append_bounded_batch_output(&mut rendered, "later", &mut diagnostics, &mut limited, 4);
-        assert!(rendered.is_empty());
-        assert_eq!(diagnostics.len(), 1);
     }
 
     #[test]
