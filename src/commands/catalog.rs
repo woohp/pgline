@@ -233,12 +233,12 @@ fn append_relation_description(
     }
     if !append_optional_catalog_table(
         rendered,
-        "Constraints:\n",
+        "\nConstraints:\n",
         take_catalog_table(&mut details.constraints, relation.oid, "constraints")?,
         limits.row_limit,
     ) || !append_optional_catalog_table(
         rendered,
-        "Indexes:\n",
+        "\nIndexes:\n",
         take_catalog_table(&mut details.indexes, relation.oid, "indexes")?,
         limits.row_limit,
     ) {

@@ -102,7 +102,7 @@ impl SqlCompleter {
         line: &str,
         word_start: usize,
     ) -> Vec<(String, Option<String>)> {
-        if line.trim_start().starts_with('\\') {
+        if line.trim_start().starts_with('\\') && !is_describe_argument_completion(line) {
             return COMMANDS
                 .iter()
                 .map(|(command, help)| ((*command).into(), Some((*help).into())))
@@ -141,7 +141,8 @@ impl SqlCompleter {
             .map(|token| before[token.start..token.end].to_ascii_uppercase());
 
         let mut values = BTreeSet::new();
-        let relation_context = previous.as_deref().is_some_and(is_relation_context);
+        let relation_context = is_describe_argument_completion(line)
+            || previous.as_deref().is_some_and(is_relation_context);
         if relation_context {
             values.extend(
                 metadata
@@ -336,17 +337,25 @@ fn completion_start(line: &str, pos: usize, standard_conforming_strings: bool) -
         .map_or(start, |token| token.start)
 }
 
+fn is_describe_argument_completion(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed
+        .strip_prefix("\\d")
+        .and_then(|rest| rest.strip_prefix('+').unwrap_or(rest).chars().next())
+        .is_some_and(char::is_whitespace)
+}
+
 impl Completer for SqlCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
-        let (start, prefix) = if line[..pos].trim_start().starts_with('\\') {
+        let standard_conforming_strings = self.standard_conforming_strings.load(Ordering::Relaxed);
+        let (start, prefix) = if is_describe_argument_completion(&line[..pos]) {
+            let start = completion_start(line, pos, standard_conforming_strings);
+            (start, &line[start..pos])
+        } else if line[..pos].trim_start().starts_with('\\') {
             let start = line[..pos].find('\\').unwrap_or(0);
             (start, &line[start..pos])
         } else {
-            let start = completion_start(
-                line,
-                pos,
-                self.standard_conforming_strings.load(Ordering::Relaxed),
-            );
+            let start = completion_start(line, pos, standard_conforming_strings);
             (start, &line[start..pos])
         };
         let prefix_lower = prefix.to_ascii_lowercase();
@@ -556,6 +565,23 @@ mod tests {
             .complete("select * from ", 14);
             assert!(!suggestions.iter().any(|suggestion| suggestion.value == raw));
         }
+    }
+
+    #[test]
+    fn suggests_relations_for_describe_arguments() {
+        let values: Vec<_> = completer()
+            .complete("\\d us", 5)
+            .into_iter()
+            .map(|suggestion| suggestion.value)
+            .collect();
+        assert_eq!(values, ["users"]);
+
+        let values: Vec<_> = completer()
+            .complete("\\d+ us", 6)
+            .into_iter()
+            .map(|suggestion| suggestion.value)
+            .collect();
+        assert_eq!(values, ["users"]);
     }
 
     #[test]
