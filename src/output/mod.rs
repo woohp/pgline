@@ -16,6 +16,57 @@ use crate::{
     error::{AppError, Result},
 };
 
+/// How much result data may be held in memory for human-readable output.
+///
+/// A budget may be shared by several [`ResultSet`]s — `\d pattern` renders one
+/// table per category from a single query and caps their combined size — so the
+/// running totals live here rather than on the result sets themselves. Once a
+/// budget is exhausted it stays exhausted: later rows are counted but dropped,
+/// and every result set that loses a row records that in `retention_limited`.
+#[derive(Debug)]
+pub struct RetentionBudget {
+    retained_bytes: usize,
+    retained_cells: usize,
+    max_bytes: usize,
+    max_cells: usize,
+    exhausted: bool,
+}
+
+impl RetentionBudget {
+    pub fn for_human_result() -> Self {
+        Self::with_limits(MAX_HUMAN_RESULT_BYTES, MAX_HUMAN_RESULT_CELLS)
+    }
+
+    pub fn with_limits(max_bytes: usize, max_cells: usize) -> Self {
+        Self {
+            retained_bytes: 0,
+            retained_cells: 0,
+            max_bytes,
+            max_cells,
+            exhausted: false,
+        }
+    }
+
+    pub fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Charges `bytes` and `cells` against the budget, reporting whether they
+    /// fit. Anything that does not fit exhausts the budget permanently.
+    pub fn take(&mut self, bytes: usize, cells: usize) -> bool {
+        if self.exhausted
+            || self.retained_bytes.saturating_add(bytes) > self.max_bytes
+            || self.retained_cells.saturating_add(cells) > self.max_cells
+        {
+            self.exhausted = true;
+            return false;
+        }
+        self.retained_bytes += bytes;
+        self.retained_cells += cells;
+        true
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ResultSet {
     pub has_row_description: bool,
@@ -25,14 +76,20 @@ pub struct ResultSet {
     pub affected_rows: u64,
     pub fields_truncated: bool,
     pub retention_limited: bool,
-    pub retained_bytes: usize,
-    pub retained_cells: usize,
 }
 
 impl ResultSet {
-    pub fn initialize_retention(&mut self) {
-        self.retained_bytes = self.columns.iter().map(String::len).sum();
-        self.retained_cells = self.columns.len();
+    /// Starts a result set for `columns`, charging the header to `budget`.
+    pub fn with_columns(columns: Vec<String>, budget: &mut RetentionBudget) -> Self {
+        let header_bytes = columns.iter().map(String::len).sum();
+        let header_cells = columns.len();
+        let mut result = Self {
+            has_row_description: true,
+            columns,
+            ..Self::default()
+        };
+        result.retention_limited = !budget.take(header_bytes, header_cells);
+        result
     }
 
     pub fn retain_human_row(
@@ -40,23 +97,29 @@ impl ResultSet {
         values: &[Option<&str>],
         row_limit: usize,
         max_field_width: usize,
-        max_bytes: usize,
-        max_cells: usize,
+        budget: &mut RetentionBudget,
     ) {
         self.total_rows += 1;
-        if (row_limit != 0 && self.total_rows > row_limit) || self.retention_limited {
+        if row_limit != 0 && self.total_rows > row_limit {
+            return;
+        }
+        if budget.is_exhausted() {
+            self.retention_limited = true;
             return;
         }
 
         // Empty rows still allocate and vertical output gives each one a
         // heading, so they must consume the cell budget.
         let row_cells = values.len().max(1);
-        let row_bytes = values.iter().try_fold(0usize, |total, value| {
+        // A row whose total width overflows `usize` cannot fit any budget, so
+        // treat the overflow itself as exhausting it.
+        let fits = match values.iter().try_fold(0usize, |total, value| {
             total.checked_add(value.map_or(0, |value| retained_field_len(value, max_field_width)))
-        });
-        if self.retained_cells.saturating_add(row_cells) > max_cells
-            || row_bytes.is_none_or(|bytes| self.retained_bytes.saturating_add(bytes) > max_bytes)
-        {
+        }) {
+            Some(row_bytes) => budget.take(row_bytes, row_cells),
+            None => budget.take(usize::MAX, row_cells),
+        };
+        if !fits {
             self.retention_limited = true;
             return;
         }
@@ -69,8 +132,6 @@ impl ResultSet {
                 value
             }));
         }
-        self.retained_bytes += row_bytes.unwrap();
-        self.retained_cells += row_cells;
         self.rows.push(row);
     }
 }
@@ -522,20 +583,37 @@ mod tests {
 
     #[test]
     fn human_row_retention_enforces_budgets_without_a_row_limit() {
-        let mut result = ResultSet {
-            has_row_description: true,
-            columns: vec!["value".into()],
-            ..ResultSet::default()
-        };
-        result.initialize_retention();
-        result.retain_human_row(&[Some("one")], 0, 0, 8, 2);
-        result.retain_human_row(&[Some("two")], 0, 0, 8, 2);
-        result.retain_human_row(&[Some("three")], 0, 0, 8, 2);
+        let mut budget = RetentionBudget::with_limits(8, 2);
+        let mut result = ResultSet::with_columns(vec!["value".into()], &mut budget);
+        result.retain_human_row(&[Some("one")], 0, 0, &mut budget);
+        result.retain_human_row(&[Some("two")], 0, 0, &mut budget);
+        result.retain_human_row(&[Some("three")], 0, 0, &mut budget);
 
         assert_eq!(result.total_rows, 3);
         assert_eq!(result.rows, [vec![Some("one".into())]]);
         assert!(result.retention_limited);
         assert!(render_human_table(&result, false, false).contains("[output limited]"));
+    }
+
+    #[test]
+    fn several_result_sets_can_share_one_retention_budget() {
+        let mut budget = RetentionBudget::with_limits(10, 10);
+        let mut columns = ResultSet::with_columns(Vec::new(), &mut budget);
+        let mut constraints = ResultSet::with_columns(Vec::new(), &mut budget);
+        let mut indexes = ResultSet::with_columns(Vec::new(), &mut budget);
+
+        columns.retain_human_row(&[Some("1234567")], 0, 0, &mut budget);
+        constraints.retain_human_row(&[Some("abc")], 0, 0, &mut budget);
+        indexes.retain_human_row(&[Some("x")], 0, 0, &mut budget);
+
+        assert_eq!(columns.rows.len(), 1);
+        assert_eq!(constraints.rows.len(), 1);
+        assert!(
+            indexes.rows.is_empty(),
+            "the shared budget was already full"
+        );
+        assert!(indexes.retention_limited);
+        assert!(budget.is_exhausted());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use tokio_postgres::{Client, types::ToSql};
 
 use crate::{
     error::{AppError, Result},
-    output::{self, ResultSet},
+    output::{self, ResultSet, RetentionBudget},
 };
 
 use super::{CatalogCommand, RelationKind};
@@ -79,7 +79,7 @@ async fn describe_relations(
     limits: CatalogLimits,
 ) -> Result<String> {
     let pattern = sql_pattern(Some(pattern))?;
-    let mut retention_budget = CatalogRetentionBudget::human_result();
+    let mut retention_budget = RetentionBudget::for_human_result();
     let relations = load_relation_matches(client, &pattern, limits, &mut retention_budget).await?;
     if relations.is_empty() {
         return Ok(format!("Did not find any relation matching {pattern:?}.\n"));
@@ -94,7 +94,7 @@ async fn load_relation_matches(
     client: &Client,
     pattern: &str,
     limits: CatalogLimits,
-    retention_budget: &mut CatalogRetentionBudget,
+    retention_budget: &mut RetentionBudget,
 ) -> Result<Vec<RelationDescription>> {
     let rows = client.query_raw(DESCRIBE_MATCHES, [pattern]).await?;
     pin_mut!(rows);
@@ -130,13 +130,13 @@ async fn load_relation_matches(
 fn retain_view_definition(
     definition: Option<&str>,
     max_field_width: usize,
-    retention_budget: &mut CatalogRetentionBudget,
+    retention_budget: &mut RetentionBudget,
 ) -> (Option<String>, bool, bool) {
     let Some(definition) = definition else {
         return (None, false, false);
     };
     let retained_len = output::retained_field_len(definition, max_field_width);
-    if !retention_budget.consume(retained_len, 1) {
+    if !retention_budget.take(retained_len, 1) {
         return (None, false, true);
     }
     let (definition, truncated) = output::truncate_field(definition, max_field_width);
@@ -155,7 +155,7 @@ async fn load_relation_details(
     relations: &[RelationDescription],
     verbose: bool,
     limits: CatalogLimits,
-    retention_budget: &mut CatalogRetentionBudget,
+    retention_budget: &mut RetentionBudget,
 ) -> Result<RelationDetails> {
     let oids: Vec<u32> = relations.iter().map(|relation| relation.oid).collect();
     let column_sql = if verbose {
@@ -336,79 +336,6 @@ struct RelationDescription {
 
 const CATALOG_OUTPUT_LIMIT_MARKER: &str = "[output limited]\n";
 
-struct CatalogRetentionBudget {
-    retained_bytes: usize,
-    retained_cells: usize,
-    max_bytes: usize,
-    max_cells: usize,
-    limited: bool,
-}
-
-impl CatalogRetentionBudget {
-    fn human_result() -> Self {
-        Self {
-            retained_bytes: 0,
-            retained_cells: 0,
-            max_bytes: output::MAX_HUMAN_RESULT_BYTES,
-            max_cells: output::MAX_HUMAN_RESULT_CELLS,
-            limited: false,
-        }
-    }
-
-    fn consume(&mut self, bytes: usize, cells: usize) -> bool {
-        if self.limited
-            || self.retained_bytes.saturating_add(bytes) > self.max_bytes
-            || self.retained_cells.saturating_add(cells) > self.max_cells
-        {
-            self.limited = true;
-            false
-        } else {
-            self.retained_bytes += bytes;
-            self.retained_cells += cells;
-            true
-        }
-    }
-
-    fn remaining_bytes(&self) -> usize {
-        self.max_bytes.saturating_sub(self.retained_bytes)
-    }
-
-    fn remaining_cells(&self) -> usize {
-        self.max_cells.saturating_sub(self.retained_cells)
-    }
-}
-
-fn retain_catalog_row(
-    result: &mut ResultSet,
-    values: &[Option<&str>],
-    limits: CatalogLimits,
-    retention_budget: &mut CatalogRetentionBudget,
-) {
-    if retention_budget.limited {
-        result.total_rows += 1;
-        result.retention_limited = true;
-        return;
-    }
-
-    let before_bytes = result.retained_bytes;
-    let before_cells = result.retained_cells;
-    result.retain_human_row(
-        values,
-        limits.row_limit,
-        limits.max_field_width,
-        before_bytes + retention_budget.remaining_bytes(),
-        before_cells + retention_budget.remaining_cells(),
-    );
-    if result.retention_limited {
-        retention_budget.limited = true;
-        return;
-    }
-    retention_budget.consume(
-        result.retained_bytes - before_bytes,
-        result.retained_cells - before_cells,
-    );
-}
-
 struct CatalogTable {
     result: ResultSet,
 }
@@ -469,7 +396,7 @@ async fn query_grouped_tables(
     sql: &str,
     oids: &[u32],
     limits: CatalogLimits,
-    retention_budget: &mut CatalogRetentionBudget,
+    retention_budget: &mut RetentionBudget,
 ) -> Result<HashMap<u32, CatalogTable>> {
     let statement = client.prepare(sql).await?;
     let columns: Vec<String> = statement
@@ -481,18 +408,12 @@ async fn query_grouped_tables(
     let mut grouped: HashMap<u32, ResultSet> = oids
         .iter()
         .map(|oid| {
-            let mut result = ResultSet {
-                has_row_description: true,
-                columns: columns.clone(),
-                ..ResultSet::default()
-            };
-            result.initialize_retention();
-            (*oid, result)
+            (
+                *oid,
+                ResultSet::with_columns(columns.clone(), retention_budget),
+            )
         })
         .collect();
-    let header_bytes = grouped.values().map(|result| result.retained_bytes).sum();
-    let header_cells = grouped.values().map(|result| result.retained_cells).sum();
-    retention_budget.consume(header_bytes, header_cells);
     let rows = client.query_raw(&statement, [oids]).await?;
     pin_mut!(rows);
 
@@ -505,7 +426,12 @@ async fn query_grouped_tables(
             ))
         })?;
         let values: Vec<Option<&str>> = (1..row.len()).map(|index| row.get(index)).collect();
-        retain_catalog_row(result, &values, limits, retention_budget);
+        result.retain_human_row(
+            &values,
+            limits.row_limit,
+            limits.max_field_width,
+            retention_budget,
+        );
     }
 
     Ok(grouped
@@ -539,12 +465,8 @@ async fn query_table_result(
     let rows = client.query_raw(&statement, params.iter().copied()).await?;
     pin_mut!(rows);
 
-    let mut result = ResultSet {
-        has_row_description: true,
-        columns,
-        ..ResultSet::default()
-    };
-    result.initialize_retention();
+    let mut budget = RetentionBudget::for_human_result();
+    let mut result = ResultSet::with_columns(columns, &mut budget);
     while let Some(row) = rows.next().await {
         let row = row?;
         let values: Vec<Option<&str>> = (0..row.len()).map(|index| row.get(index)).collect();
@@ -552,8 +474,7 @@ async fn query_table_result(
             &values,
             limits.row_limit,
             limits.max_field_width,
-            output::MAX_HUMAN_RESULT_BYTES,
-            output::MAX_HUMAN_RESULT_CELLS,
+            &mut budget,
         );
     }
     Ok(CatalogTable { result })
@@ -763,33 +684,6 @@ mod tests {
         assert_eq!(sql_pattern(Some("\"literal*?\"")).unwrap(), "literal*?");
         assert_eq!(sql_pattern(Some("\"a\"\"b\"")).unwrap(), "a\"b");
         assert!(sql_pattern(Some("\"unfinished")).is_err());
-    }
-
-    #[test]
-    fn grouped_categories_share_one_retention_budget() {
-        let limits = CatalogLimits {
-            row_limit: 0,
-            max_field_width: 0,
-        };
-        let mut budget = CatalogRetentionBudget {
-            retained_bytes: 0,
-            retained_cells: 0,
-            max_bytes: 10,
-            max_cells: 10,
-            limited: false,
-        };
-        let mut columns = ResultSet::default();
-        retain_catalog_row(&mut columns, &[Some("1234567")], limits, &mut budget);
-        let mut constraints = ResultSet::default();
-        retain_catalog_row(&mut constraints, &[Some("abc")], limits, &mut budget);
-        let mut indexes = ResultSet::default();
-        retain_catalog_row(&mut indexes, &[Some("x")], limits, &mut budget);
-
-        assert_eq!(columns.rows.len(), 1);
-        assert_eq!(constraints.rows.len(), 1);
-        assert!(indexes.rows.is_empty());
-        assert!(indexes.retention_limited);
-        assert_eq!(budget.retained_bytes, 10);
     }
 
     #[test]
