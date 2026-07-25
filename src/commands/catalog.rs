@@ -339,8 +339,7 @@ impl CatalogTable {
     }
 
     fn render(&self, row_limit: usize) -> String {
-        let rows_limited = row_limit != 0 && self.result.total_rows > row_limit;
-        output::render_human_table(&self.result, false, rows_limited)
+        output::render_table_output(&self.result, row_limit)
     }
 }
 

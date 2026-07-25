@@ -100,9 +100,11 @@ struct ExecutionState<'a> {
     completed_statements: usize,
     query_error: Option<tokio_postgres::Error>,
     cancelled: bool,
+    layout: output::Layout,
+    /// Delimited rows go out as they arrive; every other layout needs the whole
+    /// result set before it can be rendered.
     stream_machine: bool,
-    delimiter: char,
-    terminal: bool,
+    stdout_is_terminal: bool,
 }
 
 impl<'a> ExecutionState<'a> {
@@ -112,13 +114,8 @@ impl<'a> ExecutionState<'a> {
         cancel_token: &'a tokio_postgres::CancelToken,
         tls: &'a CancellationTls,
     ) -> Self {
-        let stream_machine = output_sink.is_some()
-            && !options.expanded
-            && matches!(options.format, OutputFormat::Csv | OutputFormat::Tsv);
-        let delimiter = match options.format {
-            OutputFormat::Tsv => '\t',
-            _ => ',',
-        };
+        let layout = output::Layout::new(options.format, options.expanded);
+        let stream_machine = output_sink.is_some() && layout.is_machine_readable();
         Self {
             options,
             output_sink,
@@ -131,10 +128,22 @@ impl<'a> ExecutionState<'a> {
             completed_statements: 0,
             query_error: None,
             cancelled: false,
+            layout,
             stream_machine,
-            delimiter,
-            terminal: std::io::stdout().is_terminal(),
+            stdout_is_terminal: std::io::stdout().is_terminal(),
         }
+    }
+
+    fn render_options(&self) -> output::RenderOptions {
+        output::RenderOptions {
+            layout: self.layout,
+            row_limit: self.options.row_limit,
+            escape_controls: self.stdout_is_terminal,
+        }
+    }
+
+    fn delimiter(&self) -> char {
+        self.layout.delimiter()
     }
 
     async fn handle_message(&mut self, message: SimpleQueryMessage) -> Result<()> {
@@ -160,8 +169,8 @@ impl<'a> ExecutionState<'a> {
         if self.stream_machine {
             self.send(output::StreamOutput::Data(output::render_delimited_header(
                 &self.current_result.columns,
-                self.delimiter,
-                self.terminal,
+                self.delimiter(),
+                self.stdout_is_terminal,
             )))
             .await?;
         }
@@ -196,8 +205,8 @@ impl<'a> ExecutionState<'a> {
             .collect::<Vec<_>>();
         self.send(output::StreamOutput::Data(output::render_delimited_row(
             &values,
-            self.delimiter,
-            self.terminal,
+            self.delimiter(),
+            self.stdout_is_terminal,
         )))
         .await
     }
@@ -205,18 +214,19 @@ impl<'a> ExecutionState<'a> {
     async fn complete_statement(&mut self, affected_rows: u64) -> Result<()> {
         self.completed_statements += 1;
         self.current_result.affected_rows = affected_rows;
-        let truncated =
-            self.options.row_limit != 0 && self.current_result.total_rows > self.options.row_limit;
-        let mut rendered = output::render_query(
-            &self.current_result,
-            self.options.format,
-            self.options.expanded,
-            truncated,
-            self.terminal,
-        );
-        if self.stream_machine {
-            rendered.data.clear();
-        }
+        let rendered = if self.stream_machine {
+            // The rows were streamed as they arrived, so only the trailing count
+            // is left to emit.
+            output::RenderedOutput {
+                data: String::new(),
+                diagnostic: Some(output::diagnostic(
+                    &self.current_result,
+                    self.options.row_limit,
+                )),
+            }
+        } else {
+            output::render_query(&self.current_result, self.render_options())
+        };
         self.emit_completed_statement(rendered).await?;
         self.current_result = ResultSet::default();
         Ok(())

@@ -273,38 +273,111 @@ fn write_stream(
     Ok(())
 }
 
-pub fn render_human_table(result: &ResultSet, expanded: bool, truncated: bool) -> String {
-    render_query(result, OutputFormat::Table, expanded, truncated, false).data
+/// How a result set is laid out.
+///
+/// This collapses `--format` and `--expanded`, which overlap: `-x` on any format
+/// and `--format=vertical` both mean one field per line. Deciding once here is
+/// what lets rendering be a total match on the layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Layout {
+    Table,
+    Vertical,
+    Delimited(char),
 }
 
-pub fn render_query(
-    result: &ResultSet,
-    format: OutputFormat,
-    expanded: bool,
-    truncated: bool,
-    terminal: bool,
-) -> RenderedOutput {
-    let machine = matches!(format, OutputFormat::Csv | OutputFormat::Tsv) && !expanded;
-    let data = if expanded || matches!(format, OutputFormat::Vertical) {
-        render_vertical(result)
-    } else {
-        match format {
-            OutputFormat::Table => render_table(result),
-            OutputFormat::Csv => render_delimited(result, ',', terminal),
-            OutputFormat::Tsv => render_delimited(result, '\t', terminal),
-            OutputFormat::Vertical => unreachable!(),
+impl Layout {
+    pub fn new(format: OutputFormat, expanded: bool) -> Self {
+        if expanded {
+            return Self::Vertical;
         }
-    };
-    let mut diagnostic = if !result.has_row_description {
-        format!("{} row(s) affected", result.affected_rows)
-    } else {
+        match format {
+            OutputFormat::Table => Self::Table,
+            OutputFormat::Vertical => Self::Vertical,
+            OutputFormat::Csv => Self::Delimited(','),
+            OutputFormat::Tsv => Self::Delimited('\t'),
+        }
+    }
+
+    /// Delimited output is meant for another program to read, so its row count
+    /// travels beside the data rather than inside it.
+    pub fn is_machine_readable(self) -> bool {
+        matches!(self, Self::Delimited(_))
+    }
+
+    /// The field separator, for callers streaming rows one at a time instead of
+    /// rendering a whole result set.
+    pub fn delimiter(self) -> char {
+        match self {
+            Self::Delimited(delimiter) => delimiter,
+            _ => ',',
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct RenderOptions {
+    pub layout: Layout,
+    /// Rows retained per result set; 0 means unlimited.
+    pub row_limit: usize,
+    /// Escape control characters, for output going to a terminal rather than to
+    /// a file or another program.
+    pub escape_controls: bool,
+}
+
+/// Renders `result` the way interactive table output does, for callers that
+/// assemble their own composite output.
+pub fn render_table_output(result: &ResultSet, row_limit: usize) -> String {
+    render_query(
+        result,
+        RenderOptions {
+            layout: Layout::Table,
+            row_limit,
+            escape_controls: false,
+        },
+    )
+    .data
+}
+
+pub fn render_query(result: &ResultSet, options: RenderOptions) -> RenderedOutput {
+    let data = render_data(result, options);
+    let diagnostic = diagnostic(result, options.row_limit);
+    if options.layout.is_machine_readable() {
+        return RenderedOutput {
+            data,
+            diagnostic: Some(diagnostic),
+        };
+    }
+    let mut data = data;
+    data.push_str(&diagnostic);
+    data.push('\n');
+    RenderedOutput {
+        data,
+        diagnostic: None,
+    }
+}
+
+fn render_data(result: &ResultSet, options: RenderOptions) -> String {
+    match options.layout {
+        Layout::Table => render_table(result),
+        Layout::Vertical => render_vertical(result),
+        Layout::Delimited(delimiter) => {
+            render_delimited(result, delimiter, options.escape_controls)
+        }
+    }
+}
+
+/// The trailing row count, plus a note for each way the result was cut short.
+pub fn diagnostic(result: &ResultSet, row_limit: usize) -> String {
+    let mut diagnostic = if result.has_row_description {
         format!(
             "({} row{})",
             result.total_rows,
             if result.total_rows == 1 { "" } else { "s" }
         )
+    } else {
+        format!("{} row(s) affected", result.affected_rows)
     };
-    if truncated {
+    if dropped_rows(result.total_rows, row_limit) {
         diagnostic.push_str(" [rows limited]");
     }
     if result.retention_limited {
@@ -313,21 +386,12 @@ pub fn render_query(
     if result.fields_truncated {
         diagnostic.push_str(" [fields truncated]");
     }
+    diagnostic
+}
 
-    if machine {
-        RenderedOutput {
-            data,
-            diagnostic: Some(diagnostic),
-        }
-    } else {
-        let mut data = data;
-        data.push_str(&diagnostic);
-        data.push('\n');
-        RenderedOutput {
-            data,
-            diagnostic: None,
-        }
-    }
+/// Whether `--row-limit` held rows back. A limit of zero means unlimited.
+pub fn dropped_rows(total_rows: usize, row_limit: usize) -> bool {
+    row_limit != 0 && total_rows > row_limit
 }
 
 fn render_table(result: &ResultSet) -> String {
@@ -365,35 +429,43 @@ fn render_vertical(result: &ResultSet) -> String {
     output
 }
 
-pub fn render_delimited_header(columns: &[String], delimiter: char, terminal: bool) -> String {
+pub fn render_delimited_header(
+    columns: &[String],
+    delimiter: char,
+    escape_controls: bool,
+) -> String {
     if columns.is_empty() {
         return "\n".into();
     }
     let separator = delimiter.to_string();
     let mut output = columns
         .iter()
-        .map(|value| escape_machine(Some(value.as_str()), delimiter, terminal))
+        .map(|value| escape_delimited_field(Some(value.as_str()), delimiter, escape_controls))
         .collect::<Vec<_>>()
         .join(&separator);
     output.push('\n');
     output
 }
 
-pub fn render_delimited_row(row: &[Option<String>], delimiter: char, terminal: bool) -> String {
+pub fn render_delimited_row(
+    row: &[Option<String>],
+    delimiter: char,
+    escape_controls: bool,
+) -> String {
     if row.is_empty() {
         return "\n".into();
     }
     let separator = delimiter.to_string();
     let mut output = row
         .iter()
-        .map(|value| escape_machine(value.as_deref(), delimiter, terminal))
+        .map(|value| escape_delimited_field(value.as_deref(), delimiter, escape_controls))
         .collect::<Vec<_>>()
         .join(&separator);
     output.push('\n');
     output
 }
 
-fn render_delimited(result: &ResultSet, delimiter: char, terminal: bool) -> String {
+fn render_delimited(result: &ResultSet, delimiter: char, escape_controls: bool) -> String {
     if result.columns.is_empty() {
         return if result.has_row_description {
             // The empty first record is the zero-field header.
@@ -402,20 +474,20 @@ fn render_delimited(result: &ResultSet, delimiter: char, terminal: bool) -> Stri
             String::new()
         };
     }
-    let mut output = render_delimited_header(&result.columns, delimiter, terminal);
+    let mut output = render_delimited_header(&result.columns, delimiter, escape_controls);
     for row in &result.rows {
-        output.push_str(&render_delimited_row(row, delimiter, terminal));
+        output.push_str(&render_delimited_row(row, delimiter, escape_controls));
     }
     output
 }
 
-fn escape_machine(value: Option<&str>, delimiter: char, terminal: bool) -> String {
+fn escape_delimited_field(value: Option<&str>, delimiter: char, escape_controls: bool) -> String {
     let Some(value) = value else {
         // PostgreSQL CSV convention: an unquoted empty field is NULL.
         return String::new();
     };
     let safe;
-    let value = if terminal {
+    let value = if escape_controls {
         safe = safe_terminal_text(value);
         &safe
     } else {
@@ -582,6 +654,14 @@ mod tests {
         }
     }
 
+    fn options(layout: Layout) -> RenderOptions {
+        RenderOptions {
+            layout,
+            row_limit: 0,
+            escape_controls: false,
+        }
+    }
+
     fn result() -> ResultSet {
         ResultSet {
             has_row_description: true,
@@ -599,7 +679,7 @@ mod tests {
 
     #[test]
     fn renders_psql_table() {
-        let text = render_human_table(&result(), false, false);
+        let text = render_table_output(&result(), 0);
         assert!(text.contains(" id | name "));
         assert!(text.contains("<null>"));
         assert!(text.ends_with("(2 rows)\n"));
@@ -607,14 +687,14 @@ mod tests {
 
     #[test]
     fn renders_vertical_records() {
-        let text = render_human_table(&result(), true, false);
+        let text = render_query(&result(), options(Layout::Vertical)).data;
         assert!(text.contains("-[ RECORD 1 ]-"));
         assert!(text.contains("name | Ada, \"A\""));
     }
 
     #[test]
     fn csv_quotes_special_values_and_uses_unquoted_null() {
-        let text = render_query(&result(), OutputFormat::Csv, false, false, false);
+        let text = render_query(&result(), options(Layout::Delimited(',')));
         assert_eq!(text.data, "id,name\n1,\"Ada, \"\"A\"\"\"\n2,\n");
         assert_eq!(text.diagnostic.as_deref(), Some("(2 rows)"));
     }
@@ -629,11 +709,11 @@ mod tests {
             ..ResultSet::default()
         };
         assert_eq!(
-            render_query(&result, OutputFormat::Csv, false, false, false).data,
+            render_query(&result, options(Layout::Delimited(','))).data,
             "null_value,empty_value\n,\"\"\n"
         );
         assert_eq!(
-            render_query(&result, OutputFormat::Tsv, false, false, false).data,
+            render_query(&result, options(Layout::Delimited('\t'))).data,
             "null_value\tempty_value\n\t\"\"\n"
         );
     }
@@ -644,7 +724,7 @@ mod tests {
             has_row_description: true,
             ..ResultSet::default()
         };
-        let rendered = render_query(&empty, OutputFormat::Table, false, false, false);
+        let rendered = render_query(&empty, options(Layout::Table));
         assert_eq!(rendered.data, "--\n(0 rows)\n");
 
         let rows = ResultSet {
@@ -653,7 +733,7 @@ mod tests {
             total_rows: 3,
             ..ResultSet::default()
         };
-        let rendered = render_query(&rows, OutputFormat::Csv, false, false, false);
+        let rendered = render_query(&rows, options(Layout::Delimited(',')));
         assert_eq!(rendered.data, "\n\n\n\n");
         assert_eq!(rendered.diagnostic.as_deref(), Some("(3 rows)"));
     }
@@ -669,7 +749,7 @@ mod tests {
         assert_eq!(result.total_rows, 3);
         assert_eq!(result.rows, [vec![Some("one".into())]]);
         assert!(result.retention_limited);
-        assert!(render_human_table(&result, false, false).contains("[output limited]"));
+        assert!(render_table_output(&result, 0).contains("[output limited]"));
     }
 
     #[test]
@@ -745,7 +825,7 @@ mod tests {
     fn field_truncation_has_a_distinct_diagnostic() {
         let mut result = result();
         result.fields_truncated = true;
-        let rendered = render_query(&result, OutputFormat::Csv, false, false, false);
+        let rendered = render_query(&result, options(Layout::Delimited(',')));
         assert_eq!(
             rendered.diagnostic.as_deref(),
             Some("(2 rows) [fields truncated]")
@@ -820,18 +900,24 @@ mod tests {
             fields_truncated: false,
             ..ResultSet::default()
         };
-        let table = render_human_table(&result, false, false);
+        let table = render_table_output(&result, 0);
         assert!(!table.contains('\x1b'));
         assert!(!table.contains('\x07'));
         assert!(table.contains("\\x1b"));
         assert!(table.contains("\\r\\n"));
         assert!(table.contains("\\t"));
 
-        let terminal_csv = render_query(&result, OutputFormat::Csv, false, false, true);
+        let terminal_csv = render_query(
+            &result,
+            RenderOptions {
+                escape_controls: true,
+                ..options(Layout::Delimited(','))
+            },
+        );
         assert!(!terminal_csv.data.contains('\x1b'));
         assert!(terminal_csv.data.contains("\\x1b"));
 
-        let redirected_csv = render_query(&result, OutputFormat::Csv, false, false, false);
+        let redirected_csv = render_query(&result, options(Layout::Delimited(',')));
         assert!(redirected_csv.data.contains('\x1b'));
         assert_eq!(redirected_csv.diagnostic.as_deref(), Some("(1 row)"));
     }
