@@ -48,6 +48,12 @@ pub struct Database {
     password_prompt_allowed: bool,
 }
 
+impl Database {
+    pub fn canceller(&self) -> executor::Canceller {
+        executor::Canceller::new(self.client.cancel_token(), self.tls.clone())
+    }
+}
+
 #[derive(Debug)]
 struct ConnectAttemptsError {
     errors: Vec<tokio_postgres::Error>,
@@ -187,8 +193,7 @@ async fn query_connection_info(
         tokio::signal::ctrl_c(),
         Some(STARTUP_QUERY_TIMEOUT),
         STARTUP_QUERY_TIMEOUT,
-        &client.cancel_token(),
-        tls,
+        &executor::Canceller::new(client.cancel_token(), tls.clone()),
         "connection information query",
     )
     .await?
