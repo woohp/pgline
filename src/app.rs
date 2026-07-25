@@ -21,6 +21,17 @@ use crate::{
     transaction,
 };
 
+/// How results are delivered and what a failed query means.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// At the REPL. Recoverable server errors are reported and the prompt
+    /// returns, and human output is buffered so it can be paged.
+    Repl,
+    /// Running -c, -f or piped stdin. Any error ends the process, and output is
+    /// streamed straight out.
+    OneShot,
+}
+
 pub struct App {
     database: Database,
     format: OutputFormat,
@@ -68,16 +79,16 @@ impl App {
                 };
                 return Ok(());
             }
-            return self.run_query(sql, false).await;
+            return self.run_query(sql, Mode::OneShot).await;
         }
         if let Some(path) = &cli.file {
             let path = path.clone();
             let sql = tokio::task::spawn_blocking(move || fs::read_to_string(path)).await??;
-            return self.run_query(&sql, false).await;
+            return self.run_query(&sql, Mode::OneShot).await;
         }
         if !io::stdin().is_terminal() {
             let sql = tokio::task::spawn_blocking(|| io::read_to_string(io::stdin())).await??;
-            return self.run_query(&sql, false).await;
+            return self.run_query(&sql, Mode::OneShot).await;
         }
         self.run_interactive(cli).await
     }
@@ -154,7 +165,7 @@ impl App {
                             }
                         }
                     } else if !input.trim().is_empty() {
-                        self.run_query(&input, true).await?;
+                        self.run_query(&input, Mode::Repl).await?;
                     }
                 }
                 Signal::CtrlC => {
@@ -329,14 +340,14 @@ impl App {
         Ok(())
     }
 
-    async fn run_query(&mut self, sql: &str, interactive: bool) -> Result<()> {
+    async fn run_query(&mut self, sql: &str, mode: Mode) -> Result<()> {
         self.last_query = Some(sql.to_owned());
         let standard_conforming_strings = self
             .database
             .standard_conforming_strings
             .load(Ordering::Relaxed);
         if let Some(error) = unsupported_copy_error(sql, standard_conforming_strings) {
-            if interactive {
+            if mode == Mode::Repl {
                 eprintln!("{}", output::safe_terminal_text(&error.to_string()));
                 return Ok(());
             }
@@ -345,12 +356,12 @@ impl App {
         let max_field_width =
             effective_max_field_width(self.format, self.expanded, self.max_field_width);
         let query_started = Instant::now();
-        let execution = match self.execute_sql(sql, interactive, max_field_width).await {
+        let execution = match self.execute_sql(sql, mode, max_field_width).await {
             Ok(execution) => execution,
             Err(error) => {
                 self.transaction =
                     transaction::after_error(self.transaction, sql, 0, standard_conforming_strings);
-                if interactive
+                if mode == Mode::Repl
                     && matches!(
                         &error,
                         AppError::Postgres(source)
@@ -373,7 +384,7 @@ impl App {
         self.present_execution(&execution, query_started.elapsed())?;
 
         if let Some(error) = execution.error {
-            if interactive && !error.is_closed() && error.as_db_error().is_some() {
+            if mode == Mode::Repl && !error.is_closed() && error.as_db_error().is_some() {
                 eprintln!(
                     "PostgreSQL error: {}",
                     output::safe_terminal_text(&error.to_string())
@@ -389,12 +400,12 @@ impl App {
     async fn execute_sql(
         &self,
         sql: &str,
-        interactive: bool,
+        mode: Mode,
         max_field_width: usize,
     ) -> Result<executor::Execution> {
         let stream_machine =
             !self.expanded && matches!(self.format, OutputFormat::Csv | OutputFormat::Tsv);
-        let (output_sink, stream_writer) = if interactive && !stream_machine {
+        let (output_sink, stream_writer) = if mode == Mode::Repl && !stream_machine {
             (None, None)
         } else {
             let (sink, writer) = output::stream_writer();
@@ -751,7 +762,7 @@ mod tests {
         let atomic_batch = "CREATE FUNCTION pg_temp.pgline_copy_guard() RETURNS int LANGUAGE SQL \
              BEGIN ATOMIC SELECT 1; END; COPY (SELECT 1) TO STDOUT";
         assert!(matches!(
-            app.run_query(atomic_batch, false).await,
+            app.run_query(atomic_batch, Mode::OneShot).await,
             Err(AppError::Unsupported(_))
         ));
         let function_exists: bool = app
@@ -774,10 +785,10 @@ mod tests {
             "COPY (SELECT 1) TO STDOUT",
         ] {
             assert!(matches!(
-                app.run_query(sql, false).await,
+                app.run_query(sql, Mode::OneShot).await,
                 Err(AppError::Unsupported(_))
             ));
-            assert!(app.run_query(sql, true).await.is_ok());
+            assert!(app.run_query(sql, Mode::Repl).await.is_ok());
             let value: i32 = app
                 .database
                 .client
@@ -797,15 +808,18 @@ mod tests {
         app.run_query(
             "CREATE TEMP TABLE pgline_deferred_unique(\
                  value int, UNIQUE(value) DEFERRABLE INITIALLY DEFERRED)",
-            true,
+            Mode::Repl,
         )
         .await
         .unwrap();
-        app.run_query("BEGIN", true).await.unwrap();
-        app.run_query("INSERT INTO pgline_deferred_unique VALUES (1), (1)", true)
-            .await
-            .unwrap();
-        app.run_query("COMMIT", true).await.unwrap();
+        app.run_query("BEGIN", Mode::Repl).await.unwrap();
+        app.run_query(
+            "INSERT INTO pgline_deferred_unique VALUES (1), (1)",
+            Mode::Repl,
+        )
+        .await
+        .unwrap();
+        app.run_query("COMMIT", Mode::Repl).await.unwrap();
         assert_eq!(app.transaction, TransactionStatus::Unknown);
         assert_eq!(
             app.database
@@ -826,7 +840,7 @@ mod tests {
         let mut app = App::new(&cli, database);
         app.run_query(
             "SET standard_conforming_strings = off; COMMIT; SELECT missing_column",
-            true,
+            Mode::Repl,
         )
         .await
         .unwrap();
@@ -837,7 +851,7 @@ mod tests {
         })
         .await
         .expect("parameter status did not update after the failed batch");
-        app.run_query("SET standard_conforming_strings = on", true)
+        app.run_query("SET standard_conforming_strings = on", Mode::Repl)
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -862,7 +876,7 @@ mod tests {
             Duration::from_secs(2),
             app.run_query(
                 "DO $$ BEGIN RAISE NOTICE 'streamed notice'; END $$; SELECT 1",
-                false,
+                Mode::OneShot,
             ),
         )
         .await
@@ -930,7 +944,7 @@ mod tests {
 
         let mut app = App::new(&cli, database);
         let error = app
-            .run_query("SELECT 1", true)
+            .run_query("SELECT 1", Mode::Repl)
             .await
             .expect_err("closed connections must leave the REPL");
         assert!(matches!(error, AppError::Postgres(source) if source.is_closed()));
