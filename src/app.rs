@@ -21,6 +21,16 @@ use crate::{
     transaction,
 };
 
+/// What the REPL should do once a backslash command has run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CommandOutcome {
+    Continue,
+    /// The connection changed, so the editor has to be rebuilt against the new
+    /// database's completions.
+    RebuildEditor,
+    Exit,
+}
+
 /// How results are delivered and what a failed query means.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -43,7 +53,6 @@ pub struct App {
     transaction: TransactionStatus,
     last_query: Option<String>,
     metadata: MetadataStore,
-    editor_rebuild_requested: bool,
 }
 
 impl App {
@@ -59,7 +68,6 @@ impl App {
             transaction: TransactionStatus::Idle,
             last_query: None,
             metadata: MetadataStore::default(),
-            editor_rebuild_requested: false,
         }
     }
 
@@ -75,7 +83,10 @@ impl App {
                     SpecialCommand::Invalid(message) => {
                         return Err(AppError::InvalidCommand(message));
                     }
-                    command => self.handle_command(command).await?,
+                    command => {
+                        // One-shot runs exit after the command either way.
+                        self.handle_command(command).await?;
+                    }
                 };
                 return Ok(());
             }
@@ -140,12 +151,11 @@ impl App {
                         } else {
                             let is_catalog = matches!(&command, SpecialCommand::Catalog(_));
                             match self.handle_command(command).await {
-                                Ok(true) => break,
-                                Ok(false) => {
-                                    if std::mem::take(&mut self.editor_rebuild_requested) {
-                                        editor = self.create_editor(cli)?;
-                                    }
+                                Ok(CommandOutcome::Exit) => break,
+                                Ok(CommandOutcome::RebuildEditor) => {
+                                    editor = self.create_editor(cli)?;
                                 }
+                                Ok(CommandOutcome::Continue) => {}
                                 Err(AppError::Postgres(error))
                                     if !error.is_closed() && error.as_db_error().is_some() =>
                                 {
@@ -180,7 +190,7 @@ impl App {
         Ok(())
     }
 
-    async fn handle_command(&mut self, command: SpecialCommand) -> Result<bool> {
+    async fn handle_command(&mut self, command: SpecialCommand) -> Result<CommandOutcome> {
         match command {
             SpecialCommand::Help => output::write_stdout(commands::HELP)?,
             SpecialCommand::Quit => {
@@ -189,7 +199,7 @@ impl App {
                         "A transaction is active; run ROLLBACK; before quitting (Ctrl-D twice to force)."
                     );
                 } else {
-                    return Ok(true);
+                    return Ok(CommandOutcome::Exit);
                 }
             }
             SpecialCommand::Edit(seed) => {
@@ -212,7 +222,7 @@ impl App {
                 output::write_stdout(&format!("Pager is {}.\n", on_off(self.pager)))?;
             }
             SpecialCommand::Refresh => self.refresh_metadata().await?,
-            SpecialCommand::Connect(database) => self.reconnect(&database).await?,
+            SpecialCommand::Connect(database) => return self.reconnect(&database).await,
             SpecialCommand::Catalog(command) => {
                 let catalog = commands::catalog::run(
                     &self.database.client,
@@ -245,7 +255,7 @@ impl App {
                         } else {
                             eprintln!("Catalog query cancelled.");
                         }
-                        return Ok(false);
+                        return Ok(CommandOutcome::Continue);
                     }
                 }
             }
@@ -259,7 +269,7 @@ impl App {
                 );
             }
         }
-        Ok(false)
+        Ok(CommandOutcome::Continue)
     }
 
     async fn refresh_metadata(&mut self) -> Result<()> {
@@ -295,10 +305,10 @@ impl App {
         Ok(())
     }
 
-    async fn reconnect(&mut self, database: &str) -> Result<()> {
+    async fn reconnect(&mut self, database: &str) -> Result<CommandOutcome> {
         if self.transaction != TransactionStatus::Idle {
             eprintln!("A transaction is active; run ROLLBACK; before changing connections.");
-            return Ok(());
+            return Ok(CommandOutcome::Continue);
         }
 
         let new_database = match connection::connect_to_database(&self.database, database).await {
@@ -308,7 +318,7 @@ impl App {
                     "Connection failed: {}; previous connection retained.",
                     output::safe_terminal_text(&error.to_string())
                 );
-                return Ok(());
+                return Ok(CommandOutcome::Continue);
             }
         };
         let metadata = match await_metadata_load(&new_database).await {
@@ -318,26 +328,25 @@ impl App {
                     "Connection setup failed: {}; previous connection retained.",
                     output::safe_terminal_text(&reason)
                 );
-                return Ok(());
+                return Ok(CommandOutcome::Continue);
             }
             Err(error) => {
                 eprintln!(
                     "Connection setup failed: {}; previous connection retained.",
                     output::safe_terminal_text(&error.to_string())
                 );
-                return Ok(());
+                return Ok(CommandOutcome::Continue);
             }
         };
         warn_if_metadata_truncated(&metadata);
         self.metadata.replace(metadata);
         self.database = new_database;
-        self.editor_rebuild_requested = true;
         output::write_stdout(&format!(
             "Connected to {} as {}.\n",
             output::safe_terminal_text(&self.database.info.database),
             output::safe_terminal_text(&self.database.info.user)
         ))?;
-        Ok(())
+        Ok(CommandOutcome::RebuildEditor)
     }
 
     async fn run_query(&mut self, sql: &str, mode: Mode) -> Result<()> {
@@ -625,10 +634,10 @@ mod tests {
             ..Metadata::default()
         });
 
-        app.reconnect(&target_database).await.unwrap();
+        let outcome = app.reconnect(&target_database).await.unwrap();
 
+        assert_eq!(outcome, CommandOutcome::RebuildEditor);
         assert_eq!(app.database.info.database, target_database);
-        assert!(app.editor_rebuild_requested);
         app.metadata.with_current(|metadata| {
             assert!(!metadata.relations.contains(&"stale_relation".into()));
         });
@@ -650,12 +659,13 @@ mod tests {
         let original_database = database.info.database.clone();
         let mut app = App::new(&cli, database);
 
-        app.reconnect("pgline_database_that_does_not_exist")
+        let outcome = app
+            .reconnect("pgline_database_that_does_not_exist")
             .await
             .unwrap();
 
+        assert_eq!(outcome, CommandOutcome::Continue);
         assert_eq!(app.database.info.database, original_database);
-        assert!(!app.editor_rebuild_requested);
         assert_eq!(
             app.database
                 .client
@@ -681,7 +691,10 @@ mod tests {
             .unwrap();
         let mut app = App::new(&cli, database);
 
-        assert!(!app.handle_command(SpecialCommand::Refresh).await.unwrap());
+        assert_eq!(
+            app.handle_command(SpecialCommand::Refresh).await.unwrap(),
+            CommandOutcome::Continue
+        );
 
         app.metadata.with_current(|metadata| {
             assert!(metadata.relations.contains(&"pgline_refresh_test".into()));
