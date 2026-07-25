@@ -8,7 +8,7 @@ use crate::{
     cli::OutputFormat,
     connection::CancellationTls,
     error::{AppError, Result},
-    output::{self, ResultSet},
+    output::{self, ResultSet, RetentionBudget},
 };
 
 #[derive(Clone, Copy)]
@@ -92,6 +92,9 @@ struct ExecutionState<'a> {
     cancel_token: &'a tokio_postgres::CancelToken,
     tls: &'a CancellationTls,
     current_result: ResultSet,
+    /// Reset for each result set, so one statement's rows cannot starve a later
+    /// statement in the same batch.
+    retention_budget: RetentionBudget,
     rendered: String,
     diagnostics: Vec<String>,
     completed_statements: usize,
@@ -123,6 +126,7 @@ impl<'a> ExecutionState<'a> {
             cancel_token,
             tls,
             current_result: ResultSet::default(),
+            retention_budget: RetentionBudget::for_human_result(),
             rendered: String::new(),
             diagnostics: Vec::new(),
             completed_statements: 0,
@@ -147,15 +151,14 @@ impl<'a> ExecutionState<'a> {
     }
 
     async fn begin_result(&mut self, columns: Arc<[SimpleColumn]>) -> Result<()> {
-        self.current_result = ResultSet {
-            has_row_description: true,
-            columns: columns
+        self.retention_budget = RetentionBudget::for_human_result();
+        self.current_result = ResultSet::with_columns(
+            columns
                 .iter()
                 .map(|column| column.name().to_owned())
                 .collect(),
-            ..ResultSet::default()
-        };
-        self.current_result.initialize_retention();
+            &mut self.retention_budget,
+        );
         if self.stream_machine {
             self.send(output::StreamOutput::Data(output::render_delimited_header(
                 &self.current_result.columns,
@@ -174,8 +177,7 @@ impl<'a> ExecutionState<'a> {
                 &values,
                 self.options.row_limit,
                 self.options.max_field_width,
-                output::MAX_HUMAN_RESULT_BYTES,
-                output::MAX_HUMAN_RESULT_CELLS,
+                &mut self.retention_budget,
             );
             return Ok(());
         }
