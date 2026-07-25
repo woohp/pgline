@@ -11,6 +11,8 @@ use crate::{
     output::{self, BoundedBuffer, ResultSet, RetentionBudget},
 };
 
+const CANCEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 #[derive(Clone, Copy)]
 pub struct ExecutionOptions {
     pub format: OutputFormat,
@@ -33,10 +35,10 @@ pub async fn execute(
     options: ExecutionOptions,
     output_sink: Option<&mpsc::Sender<output::StreamOutput>>,
 ) -> Result<Execution> {
-    let cancel_token = client.cancel_token();
-    let stream = open_query_stream(client, sql, output_sink, &cancel_token, tls).await?;
+    let canceller = Canceller::new(client.cancel_token(), tls.clone());
+    let stream = open_query_stream(client, sql, output_sink, &canceller).await?;
     pin_mut!(stream);
-    let mut state = ExecutionState::new(options, output_sink, &cancel_token, tls);
+    let mut state = ExecutionState::new(options, output_sink, &canceller);
 
     loop {
         let message = tokio::select! {
@@ -67,13 +69,12 @@ async fn open_query_stream<'a>(
     client: &'a Client,
     sql: &'a str,
     output_sink: Option<&mpsc::Sender<output::StreamOutput>>,
-    cancel_token: &tokio_postgres::CancelToken,
-    tls: &CancellationTls,
+    canceller: &Canceller,
 ) -> Result<SimpleQueryStream> {
     tokio::select! {
         stream = client.simple_query_raw(sql) => Ok(stream?),
         () = output_sink_closed(output_sink), if output_sink.is_some() => {
-            cancel_query(cancel_token, tls).await?;
+            canceller.cancel().await?;
             Err(AppError::OutputSinkClosed)
         }
     }
@@ -89,8 +90,7 @@ async fn output_sink_closed(output_sink: Option<&mpsc::Sender<output::StreamOutp
 struct ExecutionState<'a> {
     options: ExecutionOptions,
     output_sink: Option<&'a mpsc::Sender<output::StreamOutput>>,
-    cancel_token: &'a tokio_postgres::CancelToken,
-    tls: &'a CancellationTls,
+    canceller: &'a Canceller,
     current_result: ResultSet,
     /// Reset for each result set, so one statement's rows cannot starve a later
     /// statement in the same batch.
@@ -111,16 +111,14 @@ impl<'a> ExecutionState<'a> {
     fn new(
         options: ExecutionOptions,
         output_sink: Option<&'a mpsc::Sender<output::StreamOutput>>,
-        cancel_token: &'a tokio_postgres::CancelToken,
-        tls: &'a CancellationTls,
+        canceller: &'a Canceller,
     ) -> Self {
         let layout = output::Layout::new(options.format, options.expanded);
         let stream_machine = output_sink.is_some() && layout.is_machine_readable();
         Self {
             options,
             output_sink,
-            cancel_token,
-            tls,
+            canceller,
             current_result: ResultSet::default(),
             retention_budget: RetentionBudget::for_human_result(),
             batch: BoundedBuffer::new(output::MAX_INTERACTIVE_BATCH_BYTES, ""),
@@ -257,8 +255,7 @@ impl<'a> ExecutionState<'a> {
         send_output(
             self.output_sink.expect("stream output has an output sink"),
             message,
-            self.cancel_token,
-            self.tls,
+            self.canceller,
             &mut self.cancelled,
         )
         .await
@@ -266,7 +263,7 @@ impl<'a> ExecutionState<'a> {
 
     async fn handle_closed_output_sink(&mut self) -> Result<()> {
         if !self.cancelled {
-            cancel_query(self.cancel_token, self.tls).await?;
+            self.canceller.cancel().await?;
         }
         Ok(())
     }
@@ -278,7 +275,7 @@ impl<'a> ExecutionState<'a> {
             ));
         }
         self.cancelled = true;
-        cancel_query(self.cancel_token, self.tls).await
+        self.canceller.cancel().await
     }
 
     fn finish(self) -> Execution {
@@ -294,8 +291,7 @@ impl<'a> ExecutionState<'a> {
 async fn send_output(
     sender: &mpsc::Sender<output::StreamOutput>,
     output: output::StreamOutput,
-    cancel_token: &tokio_postgres::CancelToken,
-    tls: &CancellationTls,
+    canceller: &Canceller,
     cancelled: &mut bool,
 ) -> Result<()> {
     loop {
@@ -305,7 +301,7 @@ async fn send_output(
                     Ok(permit) => permit,
                     Err(_) => {
                         if !*cancelled {
-                            cancel_query(cancel_token, tls).await?;
+                            canceller.cancel().await?;
                         }
                         return Err(AppError::OutputSinkClosed);
                     }
@@ -324,7 +320,7 @@ async fn send_output(
                     ));
                 }
                 *cancelled = true;
-                cancel_query(cancel_token, tls).await?;
+                canceller.cancel().await?;
             }
         }
     }
@@ -343,8 +339,7 @@ pub async fn await_cancellable_query<T, Query, Interrupt>(
     interrupt: Interrupt,
     timeout: Option<Duration>,
     drain_timeout: Duration,
-    cancel_token: &tokio_postgres::CancelToken,
-    tls: &CancellationTls,
+    canceller: &Canceller,
     operation: &str,
 ) -> Result<CancellableQueryOutcome<T>>
 where
@@ -369,7 +364,7 @@ where
         () = &mut timeout => format!("{operation} timed out"),
     };
 
-    cancel_query(cancel_token, tls).await?;
+    canceller.cancel().await?;
     let drained = tokio::select! {
         result = &mut query => result,
         result = tokio::signal::ctrl_c() => {
@@ -406,25 +401,42 @@ fn is_query_cancelled(error: &tokio_postgres::Error) -> bool {
         .is_some_and(|error| *error.code() == tokio_postgres::error::SqlState::QUERY_CANCELED)
 }
 
-pub async fn cancel_query(
-    cancel_token: &tokio_postgres::CancelToken,
-    tls: &CancellationTls,
-) -> Result<()> {
-    let cancel = async {
-        match tls {
-            CancellationTls::Disabled => cancel_token.cancel_query(tokio_postgres::NoTls).await,
-            CancellationTls::Rustls(tls) => cancel_token.cancel_query(tls.clone()).await,
-        }
-    };
-    tokio::select! {
-        result = tokio::time::timeout(Duration::from_secs(5), cancel) => match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => Err(AppError::Cancellation(error.to_string())),
-            Err(_) => Err(AppError::Cancellation("timed out after 5 seconds".into())),
-        },
-        interrupt = tokio::signal::ctrl_c() => {
-            interrupt?;
-            Err(AppError::Cancellation("interrupted while sending cancellation request".into()))
+/// Cancels an in-flight query.
+///
+/// PostgreSQL cancellation opens a second connection to the server, so the
+/// request needs the same TLS setup as the connection it is cancelling. That is
+/// why the token and the TLS mode always travel together.
+#[derive(Clone)]
+pub struct Canceller {
+    token: tokio_postgres::CancelToken,
+    tls: CancellationTls,
+}
+
+impl Canceller {
+    pub fn new(token: tokio_postgres::CancelToken, tls: CancellationTls) -> Self {
+        Self { token, tls }
+    }
+
+    pub async fn cancel(&self) -> Result<()> {
+        let cancel = async {
+            match &self.tls {
+                CancellationTls::Disabled => self.token.cancel_query(tokio_postgres::NoTls).await,
+                CancellationTls::Rustls(tls) => self.token.cancel_query(tls.clone()).await,
+            }
+        };
+        tokio::select! {
+            result = tokio::time::timeout(CANCEL_REQUEST_TIMEOUT, cancel) => match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(AppError::Cancellation(error.to_string())),
+                Err(_) => Err(AppError::Cancellation(format!(
+                    "timed out after {} seconds",
+                    CANCEL_REQUEST_TIMEOUT.as_secs()
+                ))),
+            },
+            interrupt = tokio::signal::ctrl_c() => {
+                interrupt?;
+                Err(AppError::Cancellation("interrupted while sending cancellation request".into()))
+            }
         }
     }
 }
@@ -531,8 +543,7 @@ mod tests {
             std::future::pending(),
             Some(Duration::from_millis(25)),
             Duration::from_secs(2),
-            &database.client.cancel_token(),
-            &database.tls,
+            &database.canceller(),
             "test startup query",
         )
         .await
@@ -769,7 +780,7 @@ mod tests {
             .await
             .unwrap();
         let mut cancelled = false;
-        let cancel_token = database.client.cancel_token();
+        let canceller = database.canceller();
         tokio::time::timeout(Duration::from_secs(3), async {
             let sleeping = database
                 .client
@@ -777,8 +788,7 @@ mod tests {
             let blocked_send = send_output(
                 &blocked_sender,
                 output::StreamOutput::Data("blocked output".into()),
-                &cancel_token,
-                &database.tls,
+                &canceller,
                 &mut cancelled,
             );
             let close_full_sink = async {

@@ -11,7 +11,7 @@ use reedline::Signal;
 use crate::{
     cli::{Cli, OutputFormat},
     commands::{self, SpecialCommand},
-    connection::{self, CancellationTls, Database},
+    connection::{self, Database},
     copy_preflight::unsupported_copy_error,
     error::{AppError, Result},
     executor,
@@ -214,8 +214,7 @@ impl App {
                 match await_catalog_query(
                     catalog,
                     tokio::signal::ctrl_c(),
-                    &self.database.client.cancel_token(),
-                    &self.database.tls,
+                    &self.database.canceller(),
                 )
                 .await?
                 {
@@ -461,6 +460,7 @@ impl App {
 }
 
 const METADATA_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
+const CATALOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn load_startup_metadata(database: &Database) -> Result<Metadata> {
     match await_metadata_load(database).await {
@@ -491,8 +491,7 @@ async fn await_metadata_load(
         tokio::signal::ctrl_c(),
         Some(METADATA_LOAD_TIMEOUT),
         METADATA_LOAD_TIMEOUT,
-        &database.client.cancel_token(),
-        &database.tls,
+        &database.canceller(),
         "metadata loading",
     )
     .await
@@ -524,8 +523,7 @@ type CatalogQueryOutcome<T> = executor::CancellableQueryOutcome<T>;
 async fn await_catalog_query<T, Query, Interrupt>(
     query: Query,
     interrupt: Interrupt,
-    cancel_token: &tokio_postgres::CancelToken,
-    tls: &CancellationTls,
+    canceller: &executor::Canceller,
 ) -> Result<CatalogQueryOutcome<T>>
 where
     Query: Future<Output = Result<T>>,
@@ -535,9 +533,8 @@ where
         query,
         interrupt,
         None,
-        Duration::from_secs(5),
-        cancel_token,
-        tls,
+        CATALOG_DRAIN_TIMEOUT,
+        canceller,
         "catalog query",
     )
     .await
@@ -696,7 +693,7 @@ mod tests {
             .await
             .unwrap()
             .get(0);
-        let cancel_token = database.client.cancel_token();
+        let canceller = database.canceller();
         let query = async {
             database.client.query("SELECT pg_sleep(30)", &[]).await?;
             Ok::<(), AppError>(())
@@ -725,7 +722,7 @@ mod tests {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "query did not become active"))
         };
 
-        let outcome = await_catalog_query(query, interrupt, &cancel_token, &database.tls)
+        let outcome = await_catalog_query(query, interrupt, &canceller)
             .await
             .unwrap();
         assert!(matches!(
