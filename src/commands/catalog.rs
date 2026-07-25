@@ -5,7 +5,7 @@ use tokio_postgres::{Client, types::ToSql};
 
 use crate::{
     error::{AppError, Result},
-    output::{self, ResultSet, RetentionBudget},
+    output::{self, BoundedBuffer, ResultSet, RetentionBudget},
 };
 
 use super::{CatalogCommand, RelationKind};
@@ -147,7 +147,8 @@ struct RelationDetails {
     columns: HashMap<u32, CatalogTable>,
     constraints: HashMap<u32, CatalogTable>,
     indexes: HashMap<u32, CatalogTable>,
-    verbose: HashMap<u32, CatalogTable>,
+    /// Storage and size columns, populated only for the `+` command forms.
+    storage: HashMap<u32, CatalogTable>,
 }
 
 async fn load_relation_details(
@@ -177,7 +178,7 @@ async fn load_relation_details(
     .await?;
     let indexes =
         query_grouped_tables(client, DESCRIBE_INDEXES, &oids, limits, retention_budget).await?;
-    let verbose = if verbose {
+    let storage = if verbose {
         query_grouped_tables(client, DESCRIBE_DETAILS, &oids, limits, retention_budget).await?
     } else {
         HashMap::new()
@@ -186,7 +187,7 @@ async fn load_relation_details(
         columns,
         constraints,
         indexes,
-        verbose,
+        storage,
     })
 }
 
@@ -196,80 +197,72 @@ fn render_relation_descriptions(
     verbose: bool,
     limits: CatalogLimits,
 ) -> Result<String> {
-    let mut rendered = String::new();
+    let mut rendered = catalog_buffer();
     for relation in relations {
-        if !append_relation_description(&mut rendered, relation, &mut details, verbose, limits)? {
-            rendered.push_str(CATALOG_OUTPUT_LIMIT_MARKER);
+        append_relation_description(&mut rendered, relation, &mut details, verbose, limits)?;
+        if rendered.is_limited() {
             break;
         }
     }
-    Ok(rendered)
+    Ok(rendered.finish())
 }
 
 fn append_relation_description(
-    rendered: &mut String,
+    rendered: &mut BoundedBuffer,
     relation: RelationDescription,
     details: &mut RelationDetails,
     verbose: bool,
     limits: CatalogLimits,
-) -> Result<bool> {
+) -> Result<()> {
     let qualified_name = format!(
         "{}.{}",
         output::quote_identifier(&relation.schema),
         output::quote_identifier(&relation.name)
     );
-    let heading = format!(
+    rendered.push(&format!(
         "{} {}\n",
         relation_label(&relation.kind),
         output::safe_terminal_text(&qualified_name)
-    );
-    if !append_catalog_output(rendered, &heading) {
-        return Ok(false);
-    }
+    ));
 
     let columns = take_catalog_table(&mut details.columns, relation.oid, "columns")?;
-    if !append_catalog_output(rendered, &columns.render(limits.row_limit)) {
-        return Ok(false);
-    }
-    if !append_optional_catalog_table(
+    rendered.push(&columns.render(limits.row_limit));
+    append_optional_catalog_table(
         rendered,
         "\nConstraints:\n",
         take_catalog_table(&mut details.constraints, relation.oid, "constraints")?,
         limits.row_limit,
-    ) || !append_optional_catalog_table(
+    );
+    append_optional_catalog_table(
         rendered,
         "\nIndexes:\n",
         take_catalog_table(&mut details.indexes, relation.oid, "indexes")?,
         limits.row_limit,
-    ) {
-        return Ok(false);
-    }
-    if !append_view_definition(rendered, &relation) {
-        return Ok(false);
-    }
+    );
+    append_view_definition(rendered, &relation);
     if verbose {
-        let verbose = take_catalog_table(&mut details.verbose, relation.oid, "details")?;
-        if !append_catalog_output(rendered, &verbose.render(limits.row_limit)) {
-            return Ok(false);
-        }
+        let storage = take_catalog_table(&mut details.storage, relation.oid, "details")?;
+        rendered.push(&storage.render(limits.row_limit));
     }
-    Ok(true)
+    Ok(())
 }
 
 fn append_optional_catalog_table(
-    rendered: &mut String,
+    rendered: &mut BoundedBuffer,
     heading: &str,
     table: CatalogTable,
     row_limit: usize,
-) -> bool {
-    table.total_rows() == 0
-        || (append_catalog_output(rendered, heading)
-            && append_catalog_output(rendered, &table.render(row_limit)))
+) {
+    if table.total_rows() == 0 {
+        return;
+    }
+    rendered.push(heading);
+    rendered.push(&table.render(row_limit));
 }
 
-fn append_view_definition(rendered: &mut String, relation: &RelationDescription) -> bool {
+fn append_view_definition(rendered: &mut BoundedBuffer, relation: &RelationDescription) {
     if relation.view_definition.is_none() && !relation.view_definition_limited {
-        return true;
+        return;
     }
     let mut section = String::from("View definition:\n");
     if let Some(definition) = &relation.view_definition {
@@ -281,7 +274,7 @@ fn append_view_definition(rendered: &mut String, relation: &RelationDescription)
     } else {
         section.push_str(CATALOG_OUTPUT_LIMIT_MARKER);
     }
-    append_catalog_output(rendered, &section)
+    rendered.push(&section);
 }
 
 async fn list_functions(
@@ -363,32 +356,11 @@ fn take_catalog_table(
     })
 }
 
-fn append_catalog_output(rendered: &mut String, section: &str) -> bool {
-    append_catalog_output_with_limit(rendered, section, output::MAX_INTERACTIVE_BATCH_BYTES)
-}
-
-fn append_catalog_output_with_limit(rendered: &mut String, section: &str, limit: usize) -> bool {
-    let data_limit = limit.saturating_sub(CATALOG_OUTPUT_LIMIT_MARKER.len());
-    if rendered.len().saturating_add(section.len()) > data_limit {
-        false
-    } else {
-        rendered.push_str(section);
-        true
-    }
-}
-
-fn limit_catalog_output(mut rendered: String) -> String {
-    if rendered.len() <= output::MAX_INTERACTIVE_BATCH_BYTES {
-        return rendered;
-    }
-    let mut boundary =
-        output::MAX_INTERACTIVE_BATCH_BYTES.saturating_sub(CATALOG_OUTPUT_LIMIT_MARKER.len());
-    while !rendered.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    rendered.truncate(boundary);
-    rendered.push_str(CATALOG_OUTPUT_LIMIT_MARKER);
-    rendered
+fn catalog_buffer() -> BoundedBuffer {
+    BoundedBuffer::new(
+        output::MAX_INTERACTIVE_BATCH_BYTES,
+        CATALOG_OUTPUT_LIMIT_MARKER,
+    )
 }
 
 async fn query_grouped_tables(
@@ -447,7 +419,9 @@ async fn query_table(
     limits: CatalogLimits,
 ) -> Result<String> {
     let table = query_table_result(client, sql, params, limits).await?;
-    Ok(limit_catalog_output(table.render(limits.row_limit)))
+    let mut rendered = catalog_buffer();
+    rendered.push_truncated(&table.render(limits.row_limit));
+    Ok(rendered.finish())
 }
 
 async fn query_table_result(
@@ -687,17 +661,12 @@ mod tests {
     }
 
     #[test]
-    fn combined_catalog_output_reserves_space_for_the_limit_marker() {
-        let mut rendered = String::new();
-        let limit = CATALOG_OUTPUT_LIMIT_MARKER.len() + 5;
-        assert!(append_catalog_output_with_limit(
-            &mut rendered,
-            "12345",
-            limit
-        ));
-        assert!(!append_catalog_output_with_limit(&mut rendered, "6", limit));
-        rendered.push_str(CATALOG_OUTPUT_LIMIT_MARKER);
-        assert_eq!(rendered.len(), limit);
+    fn combined_catalog_output_stays_within_the_interactive_batch_limit() {
+        let mut rendered = catalog_buffer();
+        rendered.push(&"x".repeat(output::MAX_INTERACTIVE_BATCH_BYTES));
+
+        let rendered = rendered.finish();
+        assert!(rendered.len() <= output::MAX_INTERACTIVE_BATCH_BYTES);
         assert!(rendered.ends_with(CATALOG_OUTPUT_LIMIT_MARKER));
     }
 

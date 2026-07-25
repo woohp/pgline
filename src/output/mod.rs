@@ -67,6 +67,83 @@ impl RetentionBudget {
     }
 }
 
+/// A string that stops growing at a byte limit, reserving room for `marker` so
+/// that [`finish`](Self::finish) can always report the truncation.
+///
+/// Once an append is refused the buffer stays limited and later appends are
+/// no-ops, so callers can push a whole sequence of sections and test
+/// [`is_limited`](Self::is_limited) once at the end rather than threading a
+/// "still fits" flag through every step.
+pub struct BoundedBuffer {
+    text: String,
+    limit: usize,
+    marker: &'static str,
+    limited: bool,
+}
+
+impl BoundedBuffer {
+    pub fn new(limit: usize, marker: &'static str) -> Self {
+        Self {
+            text: String::new(),
+            limit,
+            marker,
+            limited: false,
+        }
+    }
+
+    pub fn is_limited(&self) -> bool {
+        self.limited
+    }
+
+    /// Appends `section` whole or not at all, reporting whether it fit. Callers
+    /// rendering independent sections want all-or-nothing so that output never
+    /// ends mid-table.
+    pub fn push(&mut self, section: &str) -> bool {
+        if self.limited {
+            return false;
+        }
+        if self.text.len().saturating_add(section.len()) > self.capacity() {
+            self.limited = true;
+            return false;
+        }
+        self.text.push_str(section);
+        true
+    }
+
+    /// Appends as much of `text` as fits, cutting on a character boundary.
+    ///
+    /// Callers with a single rendered table prefer a partial table to none, so
+    /// this trims rather than refusing. Text that fits within the limit is kept
+    /// whole and leaves the buffer unlimited — only a genuine cut is reported.
+    pub fn push_truncated(&mut self, text: &str) {
+        if self.limited {
+            return;
+        }
+        if self.text.len().saturating_add(text.len()) <= self.limit {
+            self.text.push_str(text);
+            return;
+        }
+        let mut room = self.capacity().saturating_sub(self.text.len());
+        while !text.is_char_boundary(room) {
+            room -= 1;
+        }
+        self.text.push_str(&text[..room]);
+        self.limited = true;
+    }
+
+    pub fn finish(mut self) -> String {
+        if self.limited {
+            self.text.push_str(self.marker);
+        }
+        self.text
+    }
+
+    /// The room available to data, keeping the marker in reserve.
+    fn capacity(&self) -> usize {
+        self.limit.saturating_sub(self.marker.len())
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct ResultSet {
     pub has_row_description: bool,
@@ -593,6 +670,49 @@ mod tests {
         assert_eq!(result.rows, [vec![Some("one".into())]]);
         assert!(result.retention_limited);
         assert!(render_human_table(&result, false, false).contains("[output limited]"));
+    }
+
+    #[test]
+    fn refused_sections_are_dropped_whole_and_stay_refused() {
+        let mut buffer = BoundedBuffer::new(4, "");
+        assert!(!buffer.push("oversized"));
+        assert!(!buffer.push("ok"), "the buffer stays limited once refused");
+
+        assert!(buffer.is_limited());
+        assert!(buffer.finish().is_empty(), "no partial section was written");
+    }
+
+    #[test]
+    fn a_refused_push_reserves_room_for_the_marker() {
+        let marker = "[cut]";
+        let mut buffer = BoundedBuffer::new(marker.len() + 5, marker);
+        assert!(buffer.push("12345"));
+        assert!(!buffer.push("6"));
+
+        assert_eq!(buffer.finish(), format!("12345{marker}"));
+    }
+
+    #[test]
+    fn truncating_pushes_keep_text_that_fits_whole() {
+        let mut buffer = BoundedBuffer::new(5, "[cut]");
+        buffer.push_truncated("12345");
+
+        assert!(
+            !buffer.is_limited(),
+            "text within the limit is not a truncation"
+        );
+        assert_eq!(buffer.finish(), "12345");
+    }
+
+    #[test]
+    fn truncating_pushes_cut_on_character_boundaries() {
+        // "ααα" is six bytes and the limit is four, leaving three bytes for data
+        // once the one-byte marker is reserved — mid-way through a character.
+        let mut buffer = BoundedBuffer::new(4, "!");
+        buffer.push_truncated("ααα");
+
+        assert!(buffer.is_limited());
+        assert_eq!(buffer.finish(), "α!");
     }
 
     #[test]
