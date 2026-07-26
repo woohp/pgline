@@ -30,15 +30,14 @@ pub struct Execution {
 
 pub async fn execute(
     client: &Client,
-    tls: &CancellationTls,
+    canceller: &Canceller,
     sql: &str,
     options: ExecutionOptions,
     output_sink: Option<&mpsc::Sender<output::StreamOutput>>,
 ) -> Result<Execution> {
-    let canceller = Canceller::new(client.cancel_token(), tls.clone());
-    let stream = open_query_stream(client, sql, output_sink, &canceller).await?;
+    let stream = open_query_stream(client, sql, output_sink, canceller).await?;
     pin_mut!(stream);
-    let mut state = ExecutionState::new(options, output_sink, &canceller);
+    let mut state = ExecutionState::new(options, output_sink, canceller);
 
     loop {
         let message = tokio::select! {
@@ -101,9 +100,10 @@ struct ExecutionState<'a> {
     query_error: Option<tokio_postgres::Error>,
     cancelled: bool,
     layout: output::Layout,
-    /// Delimited rows go out as they arrive; every other layout needs the whole
-    /// result set before it can be rendered.
-    stream_machine: bool,
+    /// Set when rows are streamed out as delimited text as they arrive. Every
+    /// other layout needs the whole result set before it can render anything,
+    /// and a batch with no output sink has nowhere to stream to.
+    streamed_delimiter: Option<char>,
     stdout_is_terminal: bool,
 }
 
@@ -114,7 +114,10 @@ impl<'a> ExecutionState<'a> {
         canceller: &'a Canceller,
     ) -> Self {
         let layout = output::Layout::new(options.format, options.expanded);
-        let stream_machine = output_sink.is_some() && layout.is_machine_readable();
+        let streamed_delimiter = match layout {
+            output::Layout::Delimited(delimiter) if output_sink.is_some() => Some(delimiter),
+            _ => None,
+        };
         Self {
             options,
             output_sink,
@@ -127,7 +130,7 @@ impl<'a> ExecutionState<'a> {
             query_error: None,
             cancelled: false,
             layout,
-            stream_machine,
+            streamed_delimiter,
             stdout_is_terminal: std::io::stdout().is_terminal(),
         }
     }
@@ -138,10 +141,6 @@ impl<'a> ExecutionState<'a> {
             row_limit: self.options.row_limit,
             escape_controls: self.stdout_is_terminal,
         }
-    }
-
-    fn delimiter(&self) -> char {
-        self.layout.delimiter()
     }
 
     async fn handle_message(&mut self, message: SimpleQueryMessage) -> Result<()> {
@@ -164,10 +163,10 @@ impl<'a> ExecutionState<'a> {
                 .collect(),
             &mut self.retention_budget,
         );
-        if self.stream_machine {
+        if let Some(delimiter) = self.streamed_delimiter {
             self.send(output::StreamOutput::Data(output::render_delimited_header(
                 &self.current_result.columns,
-                self.delimiter(),
+                delimiter,
                 self.stdout_is_terminal,
             )))
             .await?;
@@ -176,7 +175,7 @@ impl<'a> ExecutionState<'a> {
     }
 
     async fn retain_or_stream_row(&mut self, row: SimpleQueryRow) -> Result<()> {
-        if !self.stream_machine {
+        let Some(delimiter) = self.streamed_delimiter else {
             let values: Vec<Option<&str>> = (0..row.len()).map(|index| row.get(index)).collect();
             self.current_result.retain_human_row(
                 &values,
@@ -185,7 +184,7 @@ impl<'a> ExecutionState<'a> {
                 &mut self.retention_budget,
             );
             return Ok(());
-        }
+        };
 
         self.current_result.total_rows += 1;
         if self.options.row_limit != 0 && self.current_result.total_rows > self.options.row_limit {
@@ -203,7 +202,7 @@ impl<'a> ExecutionState<'a> {
             .collect::<Vec<_>>();
         self.send(output::StreamOutput::Data(output::render_delimited_row(
             &values,
-            self.delimiter(),
+            delimiter,
             self.stdout_is_terminal,
         )))
         .await
@@ -212,7 +211,7 @@ impl<'a> ExecutionState<'a> {
     async fn complete_statement(&mut self, affected_rows: u64) -> Result<()> {
         self.completed_statements += 1;
         self.current_result.affected_rows = affected_rows;
-        let rendered = if self.stream_machine {
+        let rendered = if self.streamed_delimiter.is_some() {
             // The rows were streamed as they arrived, so only the trailing count
             // is left to emit.
             output::RenderedOutput {
@@ -474,7 +473,7 @@ mod tests {
 
         let execution = execute(
             &database.client,
-            &database.tls,
+            &database.canceller(),
             "select 1 as answer, null as missing;",
             options(OutputFormat::Table, 500),
             None,
@@ -487,7 +486,7 @@ mod tests {
 
         let execution = execute(
             &database.client,
-            &database.tls,
+            &database.canceller(),
             "SELECT FROM generate_series(1, 3)",
             options(OutputFormat::Table, 500),
             None,
@@ -504,7 +503,7 @@ mod tests {
         let database = crate::test_support::connect().await;
         let execution = execute(
             &database.client,
-            &database.tls,
+            &database.canceller(),
             &format!(
                 "SELECT FROM generate_series(1, {})",
                 output::MAX_HUMAN_RESULT_CELLS + 1
@@ -572,7 +571,7 @@ mod tests {
         let database = crate::test_support::connect().await;
         let execution = execute(
             &database.client,
-            &database.tls,
+            &database.canceller(),
             "SELECT 1 AS kept; SELECT missing_column;",
             options(OutputFormat::Table, 500),
             None,
@@ -591,7 +590,7 @@ mod tests {
         let database = crate::test_support::connect().await;
         let execution = execute(
             &database.client,
-            &database.tls,
+            &database.canceller(),
             "SELECT repeat('x', 600) AS value",
             options(OutputFormat::Csv, 500),
             None,
@@ -608,7 +607,7 @@ mod tests {
 
         let execution = execute(
             &database.client,
-            &database.tls,
+            &database.canceller(),
             "SELECT repeat('x', 600) AS value",
             options(OutputFormat::Csv, 0),
             None,
@@ -629,7 +628,7 @@ mod tests {
             .join(", ");
         let execution = execute(
             &database.client,
-            &database.tls,
+            &database.canceller(),
             &format!("SELECT {wide_columns} FROM generate_series(1, 1000) AS rows(g)"),
             ExecutionOptions {
                 row_limit: 0,
@@ -643,7 +642,7 @@ mod tests {
 
         let execution = execute(
             &database.client,
-            &database.tls,
+            &database.canceller(),
             &format!(
                 "SELECT value FROM (VALUES (repeat('x', {})), ('SECOND')) AS rows(value)",
                 output::MAX_HUMAN_RESULT_BYTES + 1
@@ -667,7 +666,7 @@ mod tests {
         let (sender, mut receiver) = mpsc::channel(8);
         let execution = execute(
             &database.client,
-            &database.tls,
+            &database.canceller(),
             "SELECT value FROM generate_series(1, 2) AS values(value)",
             options(OutputFormat::Csv, 0),
             Some(&sender),
@@ -689,9 +688,10 @@ mod tests {
     async fn emits_completed_statements_incrementally() {
         let database = crate::test_support::connect().await;
         let (sender, mut receiver) = mpsc::channel(8);
+        let canceller = database.canceller();
         let execution = execute(
             &database.client,
-            &database.tls,
+            &canceller,
             "SELECT 1 AS first; SELECT pg_sleep(0.1); SELECT missing_column",
             options(OutputFormat::Table, 500),
             Some(&sender),
@@ -727,9 +727,10 @@ mod tests {
             .unwrap()
             .get(0);
         let (sender, receiver) = mpsc::channel(8);
+        let canceller = database.canceller();
         let execution = execute(
             &database.client,
-            &database.tls,
+            &canceller,
             "SELECT pg_sleep(30) /* pgline_sink_cancel_test */",
             options(OutputFormat::Table, 500),
             Some(&sender),
