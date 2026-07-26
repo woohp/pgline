@@ -422,7 +422,7 @@ impl App {
         };
         let execution = executor::execute(
             &self.database.client,
-            &self.database.tls,
+            &self.database.canceller(),
             sql,
             executor::ExecutionOptions {
                 format: self.format,
