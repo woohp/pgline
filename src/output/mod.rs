@@ -67,8 +67,10 @@ impl RetentionBudget {
     }
 }
 
-/// A string that stops growing at a byte limit, reserving room for `marker` so
-/// that [`finish`](Self::finish) can always report the truncation.
+/// A string that stops growing at a byte limit.
+///
+/// [`finish`](Self::finish) never returns more than `limit` bytes, including the
+/// `marker` it appends when anything was left out.
 ///
 /// Once an append is refused the buffer stays limited and later appends are
 /// no-ops, so callers can push a whole sequence of sections and test
@@ -113,8 +115,10 @@ impl BoundedBuffer {
     /// Appends as much of `text` as fits, cutting on a character boundary.
     ///
     /// Callers with a single rendered table prefer a partial table to none, so
-    /// this trims rather than refusing. Text that fits within the limit is kept
-    /// whole and leaves the buffer unlimited — only a genuine cut is reported.
+    /// this trims rather than refusing. Text that fits within the whole limit is
+    /// kept as-is and leaves the buffer unlimited — with nothing left out there
+    /// is no marker to reserve for, and `finish` reclaims the room if a later
+    /// append changes that.
     pub fn push_truncated(&mut self, text: &str) {
         if self.limited {
             return;
@@ -123,18 +127,20 @@ impl BoundedBuffer {
             self.text.push_str(text);
             return;
         }
-        let mut room = self.capacity().saturating_sub(self.text.len());
-        while !text.is_char_boundary(room) {
-            room -= 1;
-        }
-        self.text.push_str(&text[..room]);
+        let room = self.capacity().saturating_sub(self.text.len());
+        self.text.push_str(&text[..boundary_at_most(text, room)]);
         self.limited = true;
     }
 
     pub fn finish(mut self) -> String {
-        if self.limited {
-            self.text.push_str(self.marker);
+        if !self.limited {
+            return self.text;
         }
+        // push_truncated is allowed to fill the whole limit, so the marker's room
+        // is only guaranteed to be free once a marker is actually needed.
+        self.text
+            .truncate(boundary_at_most(&self.text, self.capacity()));
+        self.text.push_str(self.marker);
         self.text
     }
 
@@ -142,6 +148,15 @@ impl BoundedBuffer {
     fn capacity(&self) -> usize {
         self.limit.saturating_sub(self.marker.len())
     }
+}
+
+/// The largest character boundary of `text` at or below `byte_limit`.
+fn boundary_at_most(text: &str, byte_limit: usize) -> usize {
+    let mut boundary = byte_limit.min(text.len());
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    boundary
 }
 
 #[derive(Debug, Default)]
@@ -770,6 +785,17 @@ mod tests {
         assert!(!buffer.push("6"));
 
         assert_eq!(buffer.finish(), format!("12345{marker}"));
+    }
+
+    #[test]
+    fn a_later_refusal_still_leaves_room_for_the_marker() {
+        // push_truncated may fill the limit exactly, since text that fits needs
+        // no marker. A refused push afterwards does need one.
+        let mut buffer = BoundedBuffer::new(5, "[cut]");
+        buffer.push_truncated("12345");
+        assert!(!buffer.push("x"));
+
+        assert_eq!(buffer.finish(), "[cut]");
     }
 
     #[test]
