@@ -318,15 +318,6 @@ impl Layout {
     pub fn is_machine_readable(self) -> bool {
         matches!(self, Self::Delimited(_))
     }
-
-    /// The field separator, for callers streaming rows one at a time instead of
-    /// rendering a whole result set.
-    pub fn delimiter(self) -> char {
-        match self {
-            Self::Delimited(delimiter) => delimiter,
-            _ => ',',
-        }
-    }
 }
 
 #[derive(Clone, Copy)]
