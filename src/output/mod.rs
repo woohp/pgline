@@ -70,7 +70,8 @@ impl RetentionBudget {
 /// A string that stops growing at a byte limit.
 ///
 /// [`finish`](Self::finish) never returns more than `limit` bytes, including the
-/// `marker` it appends when anything was left out.
+/// `marker` it appends when anything was left out — which is why `limit` has to
+/// leave room for the marker in the first place. See [`new`](Self::new).
 ///
 /// Once an append is refused the buffer stays limited and later appends are
 /// no-ops, so callers can push a whole sequence of sections and test
@@ -84,7 +85,19 @@ pub struct BoundedBuffer {
 }
 
 impl BoundedBuffer {
+    /// # Panics
+    ///
+    /// Panics unless `marker` fits within `limit`. A buffer too small to report
+    /// its own truncation has no honest behaviour left: it must either exceed the
+    /// limit or drop the marker and claim the output was complete. Both callers
+    /// pass a limit measured in megabytes, so this is a programming error rather
+    /// than a condition to handle.
     pub fn new(limit: usize, marker: &'static str) -> Self {
+        assert!(
+            marker.len() <= limit,
+            "a {limit}-byte buffer cannot hold its {}-byte truncation marker",
+            marker.len()
+        );
         Self {
             text: String::new(),
             limit,
@@ -776,6 +789,21 @@ mod tests {
         assert!(!buffer.push("6"));
 
         assert_eq!(buffer.finish(), format!("12345{marker}"));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot hold its")]
+    fn a_limit_too_small_for_the_marker_is_rejected() {
+        BoundedBuffer::new("[cut]".len() - 1, "[cut]");
+    }
+
+    #[test]
+    fn a_limit_exactly_the_marker_size_is_allowed() {
+        // The tightest legal buffer: no room for data, so finish is all marker.
+        let mut buffer = BoundedBuffer::new("[cut]".len(), "[cut]");
+        assert!(!buffer.push("x"));
+
+        assert_eq!(buffer.finish(), "[cut]");
     }
 
     #[test]
