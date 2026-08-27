@@ -107,16 +107,16 @@ async fn load_relation_matches(
             continue;
         }
         let definition: Option<&str> = row.get(4);
-        let (view_definition, view_definition_truncated, view_definition_limited) =
-            retain_view_definition(definition, limits.max_field_width, retention_budget);
         relations.push(RelationDescription {
             oid: row.get(0),
             schema: row.get(1),
             name: row.get(2),
             kind: row.get(3),
-            view_definition,
-            view_definition_truncated,
-            view_definition_limited,
+            view_definition: retain_view_definition(
+                definition,
+                limits.max_field_width,
+                retention_budget,
+            ),
         });
     }
     if too_many {
@@ -131,16 +131,16 @@ fn retain_view_definition(
     definition: Option<&str>,
     max_field_width: usize,
     retention_budget: &mut RetentionBudget,
-) -> (Option<String>, bool, bool) {
+) -> ViewDefinition {
     let Some(definition) = definition else {
-        return (None, false, false);
+        return ViewDefinition::Absent;
     };
     let retained_len = output::retained_field_len(definition, max_field_width);
     if !retention_budget.take(retained_len, 1) {
-        return (None, false, true);
+        return ViewDefinition::Limited;
     }
-    let (definition, truncated) = output::truncate_field(definition, max_field_width);
-    (Some(definition), truncated, false)
+    let (text, truncated) = output::truncate_field(definition, max_field_width);
+    ViewDefinition::Retained { text, truncated }
 }
 
 struct RelationDetails {
@@ -261,18 +261,17 @@ fn append_optional_catalog_table(
 }
 
 fn append_view_definition(rendered: &mut BoundedBuffer, relation: &RelationDescription) {
-    if relation.view_definition.is_none() && !relation.view_definition_limited {
-        return;
-    }
     let mut section = String::from("View definition:\n");
-    if let Some(definition) = &relation.view_definition {
-        section.push_str(&output::safe_terminal_text(definition));
-        if relation.view_definition_truncated {
-            section.push_str("\n[view definition truncated]");
+    match &relation.view_definition {
+        ViewDefinition::Absent => return,
+        ViewDefinition::Retained { text, truncated } => {
+            section.push_str(&output::safe_terminal_text(text));
+            if *truncated {
+                section.push_str("\n[view definition truncated]");
+            }
+            section.push('\n');
         }
-        section.push('\n');
-    } else {
-        section.push_str(CATALOG_OUTPUT_LIMIT_MARKER);
+        ViewDefinition::Limited => section.push_str(CATALOG_OUTPUT_LIMIT_MARKER),
     }
     rendered.push(&section);
 }
@@ -322,9 +321,18 @@ struct RelationDescription {
     schema: String,
     name: String,
     kind: String,
-    view_definition: Option<String>,
-    view_definition_truncated: bool,
-    view_definition_limited: bool,
+    view_definition: ViewDefinition,
+}
+
+/// A relation's view definition as retained for display, if it has one.
+enum ViewDefinition {
+    Absent,
+    Retained {
+        text: String,
+        truncated: bool,
+    },
+    /// The retention budget was exhausted before the definition could be kept.
+    Limited,
 }
 
 const CATALOG_OUTPUT_LIMIT_MARKER: &str = "[output limited]\n";
