@@ -46,4 +46,17 @@ pub enum AppError {
     InvalidCommand(String),
 }
 
+impl AppError {
+    /// The server rejected a query but the connection is still usable, so an
+    /// interactive caller can report the error and keep the session.
+    pub fn as_recoverable_db_error(&self) -> Option<&tokio_postgres::Error> {
+        match self {
+            AppError::Postgres(error) if !error.is_closed() && error.as_db_error().is_some() => {
+                Some(error)
+            }
+            _ => None,
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, AppError>;
