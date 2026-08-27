@@ -262,35 +262,42 @@ async fn connect_single(
     rustls: Option<&MakeRustlsConnect>,
 ) -> std::result::Result<Connected, tokio_postgres::Error> {
     if uses_no_tls(config) {
-        let (client, mut connection) = config.connect(NoTls).await?;
-        let standard_conforming_strings = Arc::new(AtomicBool::new(
-            connection.parameter("standard_conforming_strings") != Some("off"),
-        ));
-        let observed_setting = Arc::clone(&standard_conforming_strings);
-        tokio::spawn(async move {
-            drive_connection(&mut connection, &observed_setting).await;
-        });
-        Ok((
+        let (client, connection) = config.connect(NoTls).await?;
+        Ok(spawn_connection(
             client,
+            connection,
             CancellationTls::Disabled,
-            standard_conforming_strings,
         ))
     } else {
         let rustls = rustls.expect("TLS connector is initialized for TLS-capable targets");
-        let (client, mut connection) = config.connect(rustls.clone()).await?;
-        let standard_conforming_strings = Arc::new(AtomicBool::new(
-            connection.parameter("standard_conforming_strings") != Some("off"),
-        ));
-        let observed_setting = Arc::clone(&standard_conforming_strings);
-        tokio::spawn(async move {
-            drive_connection(&mut connection, &observed_setting).await;
-        });
-        Ok((
+        let (client, connection) = config.connect(rustls.clone()).await?;
+        Ok(spawn_connection(
             client,
+            connection,
             CancellationTls::Rustls(rustls.clone()),
-            standard_conforming_strings,
         ))
     }
+}
+
+/// Hands the connection to a background task that drives it for the life of
+/// the session, and returns the pieces the client-facing side needs.
+fn spawn_connection<S, T>(
+    client: Client,
+    mut connection: Connection<S, T>,
+    tls: CancellationTls,
+) -> Connected
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let standard_conforming_strings = Arc::new(AtomicBool::new(
+        connection.parameter("standard_conforming_strings") != Some("off"),
+    ));
+    let observed_setting = Arc::clone(&standard_conforming_strings);
+    tokio::spawn(async move {
+        drive_connection(&mut connection, &observed_setting).await;
+    });
+    (client, tls, standard_conforming_strings)
 }
 
 async fn drive_connection<S, T>(
