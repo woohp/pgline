@@ -4,7 +4,7 @@ use std::{
 };
 
 use futures_util::{StreamExt, pin_mut};
-use tokio_postgres::Client;
+use tokio_postgres::{Client, types::ToSql};
 
 use crate::{error::Result, output};
 
@@ -63,142 +63,95 @@ impl Metadata {
         // names first would lose the distinction between qualification and a
         // literal dot inside an identifier.
         let mut truncated = false;
-        let schema_query_limit = (limits.schemas + 1) as i64;
-        let schema_rows = client
-            .query_raw(
-                r#"
-                SELECT pg_catalog.format('%I', n.nspname)::text
-                FROM pg_catalog.pg_namespace n
-                WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-                  AND n.nspname !~ '^pg_toast'
-                ORDER BY n.nspname = ANY(pg_catalog.current_schemas(false)) DESC,
-                         n.nspname
-                LIMIT $1
-                "#,
-                [&schema_query_limit],
-            )
-            .await?;
-        pin_mut!(schema_rows);
+
         let mut schemas = Vec::new();
-        let mut schema_count = 0;
-        while let Some(row) = schema_rows.next().await {
-            if schema_count == limits.schemas {
-                truncated = true;
-                break;
-            }
-            schema_count += 1;
-            let schema: String = row?.get(0);
-            if !has_unsafe_terminal_characters(&schema) {
-                schemas.push(schema);
-            }
-        }
+        let schema_query_limit = (limits.schemas + 1) as i64;
+        for_each_bounded_row(
+            client,
+            SCHEMA_QUERY,
+            &[&schema_query_limit],
+            limits.schemas,
+            &mut truncated,
+            |row| {
+                let schema: String = row.get(0);
+                if !has_unsafe_terminal_characters(&schema) {
+                    schemas.push(schema);
+                }
+            },
+        )
+        .await?;
 
         let mut relations = BTreeSet::new();
         let mut relation_columns: HashMap<String, Vec<String>> = HashMap::new();
         let mut relation_names = HashMap::new();
-        let relation_query_limit = (limits.relations + 1) as i64;
-        let relation_rows = client
-            .query_raw(
-                r#"
-                SELECT c.oid, pg_catalog.format('%I', n.nspname)::text,
-                       pg_catalog.format('%I', c.relname)::text,
-                       pg_catalog.pg_table_is_visible(c.oid)
-                FROM pg_catalog.pg_class c
-                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
-                  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-                  AND n.nspname !~ '^pg_toast'
-                ORDER BY pg_catalog.pg_table_is_visible(c.oid) DESC,
-                         n.nspname, c.relname
-                LIMIT $1
-                "#,
-                [&relation_query_limit],
-            )
-            .await?;
-        pin_mut!(relation_rows);
         let mut relation_oids = Vec::new();
-        let mut relation_count = 0;
-        while let Some(row) = relation_rows.next().await {
-            if relation_count == limits.relations {
-                truncated = true;
-                break;
-            }
-            relation_count += 1;
-            let row = row?;
-            let oid: u32 = row.get(0);
-            let schema: String = row.get(1);
-            let relation: String = row.get(2);
-            let visible: bool = row.get(3);
-            if has_unsafe_terminal_characters(&schema) || has_unsafe_terminal_characters(&relation)
-            {
-                continue;
-            }
-            let qualified_relation = format!("{schema}.{relation}");
-            let unqualified_relation = visible.then_some(relation);
-            if let Some(relation) = &unqualified_relation {
-                relations.insert(relation.clone());
-                relation_columns.entry(relation.clone()).or_default();
-            }
-            relations.insert(qualified_relation.clone());
-            relation_columns
-                .entry(qualified_relation.clone())
-                .or_default();
-            relation_names.insert(oid, (qualified_relation, unqualified_relation));
-            relation_oids.push(oid);
-        }
+        let relation_query_limit = (limits.relations + 1) as i64;
+        for_each_bounded_row(
+            client,
+            RELATION_QUERY,
+            &[&relation_query_limit],
+            limits.relations,
+            &mut truncated,
+            |row| {
+                let oid: u32 = row.get(0);
+                let schema: String = row.get(1);
+                let relation: String = row.get(2);
+                let visible: bool = row.get(3);
+                if has_unsafe_terminal_characters(&schema)
+                    || has_unsafe_terminal_characters(&relation)
+                {
+                    return;
+                }
+                let qualified_relation = format!("{schema}.{relation}");
+                let unqualified_relation = visible.then_some(relation);
+                if let Some(relation) = &unqualified_relation {
+                    relations.insert(relation.clone());
+                    relation_columns.entry(relation.clone()).or_default();
+                }
+                relations.insert(qualified_relation.clone());
+                relation_columns
+                    .entry(qualified_relation.clone())
+                    .or_default();
+                relation_names.insert(oid, (qualified_relation, unqualified_relation));
+                relation_oids.push(oid);
+            },
+        )
+        .await?;
 
         let mut columns = BTreeSet::new();
         let column_query_limit = (limits.columns + 1) as i64;
-        let column_rows = client
-            .query_raw(
-                r#"
-                SELECT a.attrelid, pg_catalog.format('%I', a.attname)::text
-                FROM pg_catalog.pg_attribute a
-                JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
-                JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
-                  AND a.attnum > 0 AND NOT a.attisdropped
-                  AND a.attrelid = ANY($1)
-                ORDER BY pg_catalog.array_position($1, a.attrelid), a.attnum
-                LIMIT $2
-                "#,
-                [
-                    &relation_oids as &(dyn tokio_postgres::types::ToSql + Sync),
-                    &column_query_limit,
-                ],
-            )
-            .await?;
-        pin_mut!(column_rows);
-        let mut column_count = 0;
-        while let Some(row) = column_rows.next().await {
-            if column_count == limits.columns {
-                truncated = true;
-                break;
-            }
-            let row = row?;
-            column_count += 1;
-            let oid: u32 = row.get(0);
-            let column: String = row.get(1);
-            if has_unsafe_terminal_characters(&column) {
-                continue;
-            }
-            let Some((qualified_relation, unqualified_relation)) = relation_names.get(&oid) else {
-                continue;
-            };
-            columns.insert(column.clone());
-            if let Some(relation) = unqualified_relation {
+        for_each_bounded_row(
+            client,
+            COLUMN_QUERY,
+            &[&relation_oids, &column_query_limit],
+            limits.columns,
+            &mut truncated,
+            |row| {
+                let oid: u32 = row.get(0);
+                let column: String = row.get(1);
+                if has_unsafe_terminal_characters(&column) {
+                    return;
+                }
+                let Some((qualified_relation, unqualified_relation)) = relation_names.get(&oid)
+                else {
+                    return;
+                };
+                columns.insert(column.clone());
+                if let Some(relation) = unqualified_relation {
+                    relation_columns
+                        .entry(relation.clone())
+                        .or_default()
+                        .push(column.clone());
+                }
+                // PostgreSQL guarantees unique live attribute names per relation,
+                // so preserving query order also preserves physical column order.
                 relation_columns
-                    .entry(relation.clone())
+                    .entry(qualified_relation.clone())
                     .or_default()
-                    .push(column.clone());
-            }
-            // PostgreSQL guarantees unique live attribute names per relation,
-            // so preserving query order also preserves physical column order.
-            relation_columns
-                .entry(qualified_relation.clone())
-                .or_default()
-                .push(column);
-        }
+                    .push(column);
+            },
+        )
+        .await?;
 
         Ok(Self {
             schemas,
@@ -209,6 +162,66 @@ impl Metadata {
         })
     }
 }
+
+/// Streams a query's rows into `each`, stopping after `limit` rows and
+/// recording in `truncated` when more were available.
+async fn for_each_bounded_row(
+    client: &Client,
+    sql: &str,
+    params: &[&(dyn ToSql + Sync)],
+    limit: usize,
+    truncated: &mut bool,
+    mut each: impl FnMut(tokio_postgres::Row),
+) -> Result<()> {
+    let rows = client.query_raw(sql, params.iter().copied()).await?;
+    pin_mut!(rows);
+    let mut count = 0;
+    while let Some(row) = rows.next().await {
+        if count == limit {
+            *truncated = true;
+            return Ok(());
+        }
+        count += 1;
+        each(row?);
+    }
+    Ok(())
+}
+
+const SCHEMA_QUERY: &str = r#"
+    SELECT pg_catalog.format('%I', n.nspname)::text
+    FROM pg_catalog.pg_namespace n
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND n.nspname !~ '^pg_toast'
+    ORDER BY n.nspname = ANY(pg_catalog.current_schemas(false)) DESC,
+             n.nspname
+    LIMIT $1
+"#;
+
+const RELATION_QUERY: &str = r#"
+    SELECT c.oid, pg_catalog.format('%I', n.nspname)::text,
+           pg_catalog.format('%I', c.relname)::text,
+           pg_catalog.pg_table_is_visible(c.oid)
+    FROM pg_catalog.pg_class c
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND n.nspname !~ '^pg_toast'
+    ORDER BY pg_catalog.pg_table_is_visible(c.oid) DESC,
+             n.nspname, c.relname
+    LIMIT $1
+"#;
+
+const COLUMN_QUERY: &str = r#"
+    SELECT a.attrelid, pg_catalog.format('%I', a.attname)::text
+    FROM pg_catalog.pg_attribute a
+    JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+    JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+      AND a.attnum > 0 AND NOT a.attisdropped
+      AND a.attrelid = ANY($1)
+    ORDER BY pg_catalog.array_position($1, a.attrelid), a.attnum
+    LIMIT $2
+"#;
 
 #[cfg(test)]
 mod tests {
