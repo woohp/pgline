@@ -22,12 +22,15 @@ use crate::{
 };
 
 /// What the REPL should do once a backslash command has run.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum CommandOutcome {
     Continue,
     /// The connection changed, so the editor has to be rebuilt against the new
     /// database's completions.
     RebuildEditor,
+    /// `\e` produced a query. The REPL returns it to the prompt; one-shot runs
+    /// print it.
+    ReplaceBuffer(String),
     Exit,
 }
 
@@ -85,7 +88,11 @@ impl App {
                     }
                     command => {
                         // One-shot runs exit after the command either way.
-                        self.handle_command(command).await?;
+                        if let CommandOutcome::ReplaceBuffer(query) =
+                            self.handle_command(command).await?
+                        {
+                            output::write_stdout(&query)?;
+                        }
                     }
                 };
                 return Ok(());
@@ -140,38 +147,30 @@ impl App {
             match signal {
                 Signal::Success(input) => {
                     if let Some(command) = commands::parse(&input) {
-                        if let SpecialCommand::Edit(seed) = command {
-                            let initial =
-                                seed.as_deref().or(self.last_query.as_deref()).unwrap_or("");
-                            if let Some(query) =
-                                tokio::task::block_in_place(|| commands::edit_query(initial))?
-                            {
+                        let is_catalog = matches!(&command, SpecialCommand::Catalog(_));
+                        match self.handle_command(command).await {
+                            Ok(CommandOutcome::Exit) => break,
+                            Ok(CommandOutcome::RebuildEditor) => {
+                                editor = self.create_editor(cli)?;
+                            }
+                            Ok(CommandOutcome::ReplaceBuffer(query)) => {
                                 repl::replace_buffer(&mut editor, query);
                             }
-                        } else {
-                            let is_catalog = matches!(&command, SpecialCommand::Catalog(_));
-                            match self.handle_command(command).await {
-                                Ok(CommandOutcome::Exit) => break,
-                                Ok(CommandOutcome::RebuildEditor) => {
-                                    editor = self.create_editor(cli)?;
+                            Ok(CommandOutcome::Continue) => {}
+                            Err(AppError::InvalidCommand(message)) => {
+                                eprintln!("{}", output::safe_terminal_text(&message));
+                            }
+                            Err(error) => {
+                                let Some(db_error) = error.as_recoverable_db_error() else {
+                                    return Err(error);
+                                };
+                                if is_catalog {
+                                    self.note_catalog_failure();
                                 }
-                                Ok(CommandOutcome::Continue) => {}
-                                Err(AppError::Postgres(error))
-                                    if !error.is_closed() && error.as_db_error().is_some() =>
-                                {
-                                    if is_catalog {
-                                        self.transaction =
-                                            transaction::after_catalog_operation(self.transaction);
-                                    }
-                                    eprintln!(
-                                        "PostgreSQL error: {}",
-                                        output::safe_terminal_text(&error.to_string())
-                                    );
-                                }
-                                Err(AppError::InvalidCommand(message)) => {
-                                    eprintln!("{}", output::safe_terminal_text(&message));
-                                }
-                                Err(error) => return Err(error),
+                                eprintln!(
+                                    "PostgreSQL error: {}",
+                                    output::safe_terminal_text(&db_error.to_string())
+                                );
                             }
                         }
                     } else if !input.trim().is_empty() {
@@ -206,7 +205,7 @@ impl App {
                 let initial = seed.as_deref().or(self.last_query.as_deref()).unwrap_or("");
                 if let Some(query) = tokio::task::block_in_place(|| commands::edit_query(initial))?
                 {
-                    output::write_stdout(&query)?;
+                    return Ok(CommandOutcome::ReplaceBuffer(query));
                 }
             }
             SpecialCommand::Expanded(value) => {
@@ -247,8 +246,7 @@ impl App {
                     } => {
                         let was_active = matches!(self.transaction, TransactionStatus::Active);
                         if backend_cancelled {
-                            self.transaction =
-                                transaction::after_catalog_operation(self.transaction);
+                            self.note_catalog_failure();
                         }
                         if was_active && backend_cancelled {
                             eprintln!("Catalog query cancelled; transaction is now failed.");
@@ -272,6 +270,12 @@ impl App {
         Ok(CommandOutcome::Continue)
     }
 
+    /// A catalog-flavored query failed or was cancelled on the server, which
+    /// fails an active transaction.
+    fn note_catalog_failure(&mut self) {
+        self.transaction = transaction::after_catalog_operation(self.transaction);
+    }
+
     async fn refresh_metadata(&mut self) -> Result<()> {
         match await_metadata_load(&self.database).await {
             Ok(executor::CancellableQueryOutcome::Completed(metadata)) => {
@@ -284,23 +288,23 @@ impl App {
                 backend_cancelled,
             }) => {
                 if backend_cancelled {
-                    self.transaction = transaction::after_catalog_operation(self.transaction);
+                    self.note_catalog_failure();
                 }
                 eprintln!(
                     "{}; previous completion metadata retained.",
                     output::safe_terminal_text(&reason)
                 );
             }
-            Err(AppError::Postgres(error))
-                if !error.is_closed() && error.as_db_error().is_some() =>
-            {
-                self.transaction = transaction::after_catalog_operation(self.transaction);
+            Err(error) => {
+                let Some(db_error) = error.as_recoverable_db_error() else {
+                    return Err(error);
+                };
+                self.note_catalog_failure();
                 eprintln!(
                     "Completion metadata refresh failed: {}; previous metadata retained.",
-                    output::safe_terminal_text(&error.to_string())
+                    output::safe_terminal_text(&db_error.to_string())
                 );
             }
-            Err(error) => return Err(error),
         }
         Ok(())
     }
@@ -370,13 +374,7 @@ impl App {
             Err(error) => {
                 self.transaction =
                     transaction::after_error(self.transaction, sql, 0, standard_conforming_strings);
-                if mode == Mode::Repl
-                    && matches!(
-                        &error,
-                        AppError::Postgres(source)
-                            if !source.is_closed() && source.as_db_error().is_some()
-                    )
-                {
+                if mode == Mode::Repl && error.as_recoverable_db_error().is_some() {
                     eprintln!("{}", output::safe_terminal_text(&error.to_string()));
                     return Ok(());
                 }
@@ -393,14 +391,12 @@ impl App {
         self.present_execution(&execution, query_started.elapsed())?;
 
         if let Some(error) = execution.error {
-            if mode == Mode::Repl && !error.is_closed() && error.as_db_error().is_some() {
-                eprintln!(
-                    "PostgreSQL error: {}",
-                    output::safe_terminal_text(&error.to_string())
-                );
+            let error = AppError::Postgres(error);
+            if mode == Mode::Repl && error.as_recoverable_db_error().is_some() {
+                eprintln!("{}", output::safe_terminal_text(&error.to_string()));
                 Ok(())
             } else {
-                Err(AppError::Postgres(error))
+                Err(error)
             }
         } else {
             Ok(())
@@ -492,14 +488,16 @@ async fn load_startup_metadata(database: &Database) -> Result<Metadata> {
             );
             Ok(Metadata::default())
         }
-        Err(AppError::Postgres(error)) if !error.is_closed() && error.as_db_error().is_some() => {
+        Err(error) => {
+            let Some(db_error) = error.as_recoverable_db_error() else {
+                return Err(error);
+            };
             eprintln!(
                 "warning: metadata completion unavailable: {}",
-                output::safe_terminal_text(&error.to_string())
+                output::safe_terminal_text(&db_error.to_string())
             );
             Ok(Metadata::default())
         }
-        Err(error) => Err(error),
     }
 }
 
