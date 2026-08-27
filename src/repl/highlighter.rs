@@ -6,8 +6,8 @@ use std::sync::{
 use nu_ansi_term::{Color, Style};
 use reedline::{Highlighter, StyledText};
 
-use super::scanner::{self, TokenKind};
 use crate::output;
+use crate::scanner::{self, TokenKind};
 
 pub struct SqlHighlighter {
     enabled: bool,
@@ -93,8 +93,12 @@ mod tests {
         assert!(!rendered.contains('\x1b'));
         assert!(rendered.contains("bad?😀"));
 
-        let prompt =
-            crate::repl::SqlPrompt::new("user", "host", "db", crate::repl::TransactionStatus::Idle);
+        let prompt = crate::repl::SqlPrompt::new(
+            "user",
+            "host",
+            "db",
+            crate::transaction::TransactionStatus::Idle,
+        );
         let insertion = line.find('😀').unwrap();
         let (left, right) =
             highlighted.render_around_insertion_point(insertion, &prompt, false, None);

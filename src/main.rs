@@ -8,6 +8,7 @@ mod executor;
 mod metadata;
 mod output;
 mod repl;
+mod scanner;
 #[cfg(test)]
 mod test_support;
 mod transaction;

@@ -1,6 +1,5 @@
 mod completion;
 mod highlighter;
-pub mod scanner;
 
 use std::{
     borrow::Cow,
@@ -20,7 +19,10 @@ use reedline::{
     ValidationResult, Validator, default_emacs_keybindings,
 };
 
-use crate::{cli::Cli, error::Result, metadata::MetadataStore, output};
+use crate::{
+    cli::Cli, error::Result, metadata::MetadataStore, output, scanner,
+    transaction::TransactionStatus,
+};
 
 use completion::SqlCompleter;
 use highlighter::SqlHighlighter;
@@ -145,15 +147,6 @@ impl Validator for SqlValidator {
 #[derive(Clone)]
 pub struct SqlPrompt {
     left: String,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum TransactionStatus {
-    #[default]
-    Idle,
-    Active,
-    Failed,
-    Unknown,
 }
 
 impl SqlPrompt {

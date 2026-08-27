@@ -1,4 +1,15 @@
-use crate::{repl::TransactionStatus, repl::scanner};
+use crate::scanner;
+
+/// The session's transaction state, as tracked client-side from the SQL that
+/// was submitted. `Unknown` means the SQL was too ambiguous to track.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TransactionStatus {
+    #[default]
+    Idle,
+    Active,
+    Failed,
+    Unknown,
+}
 
 pub(crate) fn after_catalog_operation(state: TransactionStatus) -> TransactionStatus {
     match state {

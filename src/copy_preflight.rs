@@ -1,4 +1,4 @@
-use crate::{error::AppError, repl::scanner};
+use crate::{error::AppError, scanner};
 
 pub(crate) fn unsupported_copy_error(
     sql: &str,
