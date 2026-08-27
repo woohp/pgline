@@ -13,7 +13,7 @@ use crate::{
     output,
 };
 
-use super::scanner::{self, TokenKind};
+use crate::scanner::{self, TokenKind};
 
 const KEYWORDS: &[&str] = &[
     "ALTER",

@@ -17,8 +17,8 @@ use crate::{
     executor,
     metadata::{Metadata, MetadataStore},
     output,
-    repl::{self, SqlPrompt, TransactionStatus},
-    transaction,
+    repl::{self, SqlPrompt},
+    transaction::{self, TransactionStatus},
 };
 
 /// What the REPL should do once a backslash command has run.
