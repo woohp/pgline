@@ -1,6 +1,6 @@
 [package]
 name = "pgline"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 
 [dependencies]
@@ -16,7 +16,12 @@ shlex = "2.0.1"
 tabled = { version = "0.21.0", default-features = false, features = ["std"] }
 tempfile = "3.27.0"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.52.3", features = [
+    "macros",
+    "rt-multi-thread",
+    "signal",
+    "time",
+] }
 tokio-postgres = "0.7.18"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
