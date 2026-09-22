@@ -443,6 +443,9 @@ impl Canceller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{
+        assert_connection_usable, backend_pid, connect, wait_until_query_active,
+    };
 
     fn options(format: OutputFormat, max_field_width: usize) -> ExecutionOptions {
         ExecutionOptions {
@@ -469,7 +472,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn executes_basic_table_queries() {
-        let database = crate::test_support::connect().await;
+        let database = connect().await;
 
         let execution = execute(
             &database.client,
@@ -500,7 +503,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn enforces_human_output_limits() {
-        let database = crate::test_support::connect().await;
+        let database = connect().await;
         let execution = execute(
             &database.client,
             &database.canceller(),
@@ -529,7 +532,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn timed_out_startup_query_is_cancelled_and_drained() {
-        let database = crate::test_support::connect().await;
+        let database = connect().await;
         let query = async {
             database
                 .client
@@ -554,21 +557,13 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(
-            database
-                .client
-                .query_one("SELECT 1", &[])
-                .await
-                .unwrap()
-                .get::<_, i32>(0),
-            1
-        );
+        assert_connection_usable(&database.client).await;
     }
 
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn preserves_completed_statements_before_an_error() {
-        let database = crate::test_support::connect().await;
+        let database = connect().await;
         let execution = execute(
             &database.client,
             &database.canceller(),
@@ -587,7 +582,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn applies_configured_field_truncation() {
-        let database = crate::test_support::connect().await;
+        let database = connect().await;
         let execution = execute(
             &database.client,
             &database.canceller(),
@@ -621,7 +616,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn enforces_wide_and_oversized_result_limits() {
-        let database = crate::test_support::connect().await;
+        let database = connect().await;
         let wide_columns = (0..101)
             .map(|index| format!("g AS c{index}"))
             .collect::<Vec<_>>()
@@ -662,7 +657,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn streams_csv_rows() {
-        let database = crate::test_support::connect().await;
+        let database = connect().await;
         let (sender, mut receiver) = mpsc::channel(8);
         let execution = execute(
             &database.client,
@@ -686,7 +681,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn emits_completed_statements_incrementally() {
-        let database = crate::test_support::connect().await;
+        let database = connect().await;
         let (sender, mut receiver) = mpsc::channel(8);
         let canceller = database.canceller();
         let execution = execute(
@@ -718,14 +713,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn sink_closure_cancels_queries_and_preserves_connection_reuse() {
-        let database = crate::test_support::connect().await;
-        let observer = crate::test_support::connect().await;
-        let pid: i32 = database
-            .client
-            .query_one("SELECT pg_backend_pid()", &[])
-            .await
-            .unwrap()
-            .get(0);
+        let database = connect().await;
+        let observer = connect().await;
+        let pid = backend_pid(&database.client).await;
         let (sender, receiver) = mpsc::channel(8);
         let canceller = database.canceller();
         let execution = execute(
@@ -737,24 +727,8 @@ mod tests {
         );
         tokio::time::timeout(Duration::from_secs(3), async {
             let close_active_sink = async {
-                loop {
-                    let active: bool = observer
-                        .client
-                        .query_one(
-                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
-                             WHERE pid = $1 AND state = 'active' \
-                               AND query LIKE '%pgline_sink_cancel_test%')",
-                            &[&pid],
-                        )
-                        .await
-                        .unwrap()
-                        .get(0);
-                    if active {
-                        drop(receiver);
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+                wait_until_query_active(&observer.client, pid, "pgline_sink_cancel_test").await;
+                drop(receiver);
             };
             let (execution, ()) = tokio::join!(execution, close_active_sink);
             let error = match execution {
@@ -762,15 +736,7 @@ mod tests {
                 Err(error) => error,
             };
             assert!(matches!(error, AppError::OutputSinkClosed));
-            assert_eq!(
-                database
-                    .client
-                    .query_one("SELECT 1", &[])
-                    .await
-                    .unwrap()
-                    .get::<_, i32>(0),
-                1
-            );
+            assert_connection_usable(&database.client).await;
         })
         .await
         .expect("active query was not cancelled and made reusable promptly");
@@ -793,38 +759,14 @@ mod tests {
                 &mut cancelled,
             );
             let close_full_sink = async {
-                loop {
-                    let active: bool = observer
-                        .client
-                        .query_one(
-                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity \
-                             WHERE pid = $1 AND state = 'active' \
-                               AND query LIKE '%pgline_reserve_cancel_test%')",
-                            &[&pid],
-                        )
-                        .await
-                        .unwrap()
-                        .get(0);
-                    if active {
-                        drop(blocked_receiver);
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+                wait_until_query_active(&observer.client, pid, "pgline_reserve_cancel_test").await;
+                drop(blocked_receiver);
             };
             let (sleeping, blocked_send, ()) =
                 tokio::join!(sleeping, blocked_send, close_full_sink);
             assert!(sleeping.is_err(), "sleeping query was not cancelled");
             assert!(matches!(blocked_send, Err(AppError::OutputSinkClosed)));
-            assert_eq!(
-                database
-                    .client
-                    .query_one("SELECT 1", &[])
-                    .await
-                    .unwrap()
-                    .get::<_, i32>(0),
-                1
-            );
+            assert_connection_usable(&database.client).await;
         })
         .await
         .expect("full output sink closure did not cancel the active query");

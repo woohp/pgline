@@ -33,7 +33,7 @@ impl Highlighter for SqlHighlighter {
 
         let mut output = StyledText::new();
         let mut position = 0;
-        for token in scanner::scan_with_standard_conforming_strings(
+        for token in scanner::scan(
             line,
             self.standard_conforming_strings.load(Ordering::Relaxed),
         )

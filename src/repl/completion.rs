@@ -75,16 +75,13 @@ pub struct SqlCompleter {
 
 impl SqlCompleter {
     #[cfg(test)]
-    fn new(metadata: Metadata) -> Self {
+    fn for_metadata(metadata: Metadata) -> Self {
         let store = MetadataStore::default();
         store.replace(metadata);
-        Self::with_standard_conforming_strings(store, Arc::new(AtomicBool::new(true)))
+        Self::new(store, Arc::new(AtomicBool::new(true)))
     }
 
-    pub fn with_standard_conforming_strings(
-        metadata: MetadataStore,
-        standard_conforming_strings: Arc<AtomicBool>,
-    ) -> Self {
+    pub fn new(metadata: MetadataStore, standard_conforming_strings: Arc<AtomicBool>) -> Self {
         Self {
             metadata,
             standard_conforming_strings,
@@ -131,8 +128,7 @@ impl SqlCompleter {
             }
         }
 
-        let scan =
-            scanner::scan_with_standard_conforming_strings(before, standard_conforming_strings);
+        let scan = scanner::scan(before, standard_conforming_strings);
         let previous = scan
             .tokens
             .iter()
@@ -181,8 +177,7 @@ fn qualified_relations(
     before_dot: &str,
     standard_conforming_strings: bool,
 ) -> Option<Vec<String>> {
-    let scan =
-        scanner::scan_with_standard_conforming_strings(before_dot, standard_conforming_strings);
+    let scan = scanner::scan(before_dot, standard_conforming_strings);
     let schema_token = scan.tokens.last()?;
     if !matches!(schema_token.kind, TokenKind::Word | TokenKind::Keyword) {
         return None;
@@ -237,12 +232,14 @@ fn trailing_identifier_components(
     input: &str,
     standard_conforming_strings: bool,
 ) -> Option<Vec<String>> {
-    let scan = scanner::scan_with_standard_conforming_strings(input, standard_conforming_strings);
+    let scan = scanner::scan(input, standard_conforming_strings);
     identifier_components_from_tokens(input, &scan.tokens, false)
 }
 
 fn identifier_components(input: &str) -> Option<Vec<String>> {
-    let scan = scanner::scan(input);
+    // Metadata identifiers come from format('%I') and never contain E strings,
+    // so the session's string conformance setting is irrelevant here.
+    let scan = scanner::scan(input, true);
     identifier_components_from_tokens(input, &scan.tokens, true)
 }
 
@@ -329,8 +326,7 @@ fn last_identifier_component(value: &str) -> &str {
 
 fn completion_start(line: &str, pos: usize, standard_conforming_strings: bool) -> usize {
     let (start, _) = scanner::word_at(line, pos);
-    let scan =
-        scanner::scan_with_standard_conforming_strings(&line[..pos], standard_conforming_strings);
+    let scan = scanner::scan(&line[..pos], standard_conforming_strings);
     scan.tokens
         .last()
         .filter(|token| token.end == pos && line.as_bytes().get(token.start) == Some(&b'"'))
@@ -348,17 +344,15 @@ fn is_describe_argument_completion(line: &str) -> bool {
 impl Completer for SqlCompleter {
     fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
         let standard_conforming_strings = self.standard_conforming_strings.load(Ordering::Relaxed);
-        let (start, prefix) = if is_describe_argument_completion(&line[..pos]) {
-            let start = completion_start(line, pos, standard_conforming_strings);
-            (start, &line[start..pos])
-        } else if line[..pos].trim_start().starts_with('\\') {
-            let start = line[..pos].find('\\').unwrap_or(0);
-            (start, &line[start..pos])
+        let typed = &line[..pos];
+        let completing_command_name =
+            typed.trim_start().starts_with('\\') && !is_describe_argument_completion(typed);
+        let start = if completing_command_name {
+            typed.find('\\').unwrap_or(0)
         } else {
-            let start = completion_start(line, pos, standard_conforming_strings);
-            (start, &line[start..pos])
+            completion_start(line, pos, standard_conforming_strings)
         };
-        let prefix_lower = prefix.to_ascii_lowercase();
+        let prefix_lower = line[start..pos].to_ascii_lowercase();
         self.candidates(line, start)
             .into_iter()
             .filter(|(value, _)| {
@@ -383,7 +377,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn completer() -> SqlCompleter {
-        SqlCompleter::new(test_metadata())
+        SqlCompleter::for_metadata(test_metadata())
     }
 
     fn test_metadata() -> Metadata {
@@ -397,21 +391,11 @@ mod tests {
     }
 
     #[test]
-    fn suggests_relations_after_from() {
+    fn suggests_unqualified_relations_after_from_without_qualified_duplicates() {
         let values: Vec<_> = completer()
             .complete("select * from us", 16)
             .into_iter()
             .map(|s| s.value)
-            .collect();
-        assert_eq!(values, ["users"]);
-    }
-
-    #[test]
-    fn unqualified_prefixes_do_not_show_qualified_duplicates() {
-        let values: Vec<_> = completer()
-            .complete("select * from us", 16)
-            .into_iter()
-            .map(|suggestion| suggestion.value)
             .collect();
         assert_eq!(values, ["users"]);
     }
@@ -424,8 +408,7 @@ mod tests {
             relations: vec!["users".into()],
             ..Metadata::default()
         });
-        let mut completer =
-            SqlCompleter::with_standard_conforming_strings(metadata, Arc::clone(&setting));
+        let mut completer = SqlCompleter::new(metadata, Arc::clone(&setting));
         let line = "SELECT 'it\\'s' FROM us";
 
         assert!(completer.complete(line, line.len()).is_empty());
@@ -436,10 +419,7 @@ mod tests {
     #[test]
     fn observes_metadata_replacements() {
         let metadata = MetadataStore::default();
-        let mut completer = SqlCompleter::with_standard_conforming_strings(
-            metadata.clone(),
-            Arc::new(AtomicBool::new(true)),
-        );
+        let mut completer = SqlCompleter::new(metadata.clone(), Arc::new(AtomicBool::new(true)));
         let line = "select * from us";
         assert!(completer.complete(line, line.len()).is_empty());
 
@@ -465,7 +445,7 @@ mod tests {
             ..Metadata::default()
         };
         let line = "select * from \"odd.schema\".Ord";
-        let values: Vec<_> = SqlCompleter::new(metadata)
+        let values: Vec<_> = SqlCompleter::for_metadata(metadata)
             .complete(line, line.len())
             .into_iter()
             .map(|suggestion| suggestion.value)
@@ -504,7 +484,7 @@ mod tests {
             "\"Order.Items\"".into(),
             "\"odd.schema\".\"Order.Items\"".into(),
         ]);
-        let values: Vec<_> = SqlCompleter::new(metadata.clone())
+        let values: Vec<_> = SqlCompleter::for_metadata(metadata.clone())
             .complete("select * from ", 14)
             .into_iter()
             .map(|suggestion| suggestion.value)
@@ -514,7 +494,7 @@ mod tests {
         assert!(values.contains(&"\"order\"".into()));
         assert!(values.contains(&"\"odd.schema\".\"Order.Items\"".into()));
 
-        let partial: Vec<_> = SqlCompleter::new(metadata)
+        let partial: Vec<_> = SqlCompleter::for_metadata(metadata)
             .complete("select * from Ord", 17)
             .into_iter()
             .map(|suggestion| suggestion.value)
@@ -522,7 +502,7 @@ mod tests {
         assert!(partial.contains(&"\"Order.Items\"".into()));
 
         let line = "select * from \"a\"\"";
-        let suggestion = SqlCompleter::new(Metadata {
+        let suggestion = SqlCompleter::for_metadata(Metadata {
             relations: vec!["\"a\"\"b\"".into()],
             ..Metadata::default()
         })
@@ -543,7 +523,7 @@ mod tests {
             ..Metadata::default()
         };
         let line = "select \"odd.schema\".\"Order.Items\".";
-        let values: Vec<_> = SqlCompleter::new(metadata)
+        let values: Vec<_> = SqlCompleter::for_metadata(metadata)
             .complete(line, line.len())
             .into_iter()
             .map(|suggestion| suggestion.value)
@@ -558,7 +538,7 @@ mod tests {
             "\"bad\u{202e}value\"",
             "\"bad\u{2067}value\"",
         ] {
-            let suggestions = SqlCompleter::new(Metadata {
+            let suggestions = SqlCompleter::for_metadata(Metadata {
                 relations: vec![raw.into()],
                 ..Metadata::default()
             })

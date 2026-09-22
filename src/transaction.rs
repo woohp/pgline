@@ -106,7 +106,7 @@ enum StatementAnalysis {
 }
 
 fn top_level_statements(sql: &str, standard_conforming_strings: bool) -> StatementAnalysis {
-    let scan = scanner::scan_with_standard_conforming_strings(sql, standard_conforming_strings);
+    let scan = scanner::scan(sql, standard_conforming_strings);
     let mut statements = vec![Vec::new()];
     let mut parenthesis_depth = 0usize;
 

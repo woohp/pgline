@@ -1,6 +1,5 @@
 use std::{
     fs,
-    future::Future,
     io::{self, IsTerminal},
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
@@ -9,14 +8,14 @@ use std::{
 use reedline::Signal;
 
 use crate::{
-    cli::{Cli, OutputFormat},
-    commands::{self, SpecialCommand},
+    cli::Cli,
+    commands::{self, CatalogCommand, SpecialCommand},
     connection::{self, Database},
     copy_preflight::unsupported_copy_error,
     error::{AppError, Result},
-    executor,
+    executor::{self, CancellableQueryOutcome},
     metadata::{Metadata, MetadataStore},
-    output,
+    output::{self, Layout},
     repl::{self, SqlPrompt},
     transaction::{self, TransactionStatus},
 };
@@ -45,62 +44,48 @@ pub enum Mode {
     OneShot,
 }
 
+const DEFAULT_MAX_FIELD_WIDTH: usize = 500;
+const METADATA_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
+const CATALOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct App {
+    cli: Cli,
     database: Database,
-    format: OutputFormat,
+    // Session settings that backslash commands can toggle after startup.
     expanded: bool,
     timing: bool,
     pager: bool,
-    row_limit: usize,
-    max_field_width: Option<usize>,
     transaction: TransactionStatus,
     last_query: Option<String>,
     metadata: MetadataStore,
 }
 
 impl App {
-    pub fn new(cli: &Cli, database: Database) -> Self {
+    pub fn new(cli: Cli, database: Database) -> Self {
         Self {
-            database,
-            format: cli.format,
             expanded: cli.expanded,
             timing: cli.timing,
             pager: !cli.no_pager,
-            row_limit: cli.row_limit,
-            max_field_width: cli.max_field_width,
+            cli,
+            database,
             transaction: TransactionStatus::Idle,
             last_query: None,
             metadata: MetadataStore::default(),
         }
     }
 
-    pub async fn run(mut self, cli: &Cli) -> Result<()> {
-        if let Some(sql) = &cli.execute {
-            if let Some(command) = commands::parse(sql) {
-                match command {
-                    SpecialCommand::Unknown(name) => {
-                        return Err(AppError::InvalidCommand(format!(
-                            "unknown command: \\{name}"
-                        )));
-                    }
-                    SpecialCommand::Invalid(message) => {
-                        return Err(AppError::InvalidCommand(message));
-                    }
-                    command => {
-                        // One-shot runs exit after the command either way.
-                        if let CommandOutcome::ReplaceBuffer(query) =
-                            self.handle_command(command).await?
-                        {
-                            output::write_stdout(&query)?;
-                        }
-                    }
-                };
+    pub async fn run(mut self) -> Result<()> {
+        if let Some(sql) = self.cli.execute.clone() {
+            if let Some(command) = commands::parse(&sql) {
+                // One-shot runs exit after the command either way.
+                if let CommandOutcome::ReplaceBuffer(query) = self.handle_command(command?).await? {
+                    output::write_stdout(&query)?;
+                }
                 return Ok(());
             }
-            return self.run_query(sql, Mode::OneShot).await;
+            return self.run_query(&sql, Mode::OneShot).await;
         }
-        if let Some(path) = &cli.file {
-            let path = path.clone();
+        if let Some(path) = self.cli.file.clone() {
             let sql = tokio::task::spawn_blocking(move || fs::read_to_string(path)).await??;
             return self.run_query(&sql, Mode::OneShot).await;
         }
@@ -108,18 +93,18 @@ impl App {
             let sql = tokio::task::spawn_blocking(|| io::read_to_string(io::stdin())).await??;
             return self.run_query(&sql, Mode::OneShot).await;
         }
-        self.run_interactive(cli).await
+        self.run_interactive().await
     }
 
-    fn create_editor(&self, cli: &Cli) -> Result<reedline::Reedline> {
+    fn create_editor(&self) -> Result<reedline::Reedline> {
         repl::create_editor(
-            cli,
+            &self.cli,
             self.metadata.clone(),
             Arc::clone(&self.database.standard_conforming_strings),
         )
     }
 
-    async fn run_interactive(&mut self, cli: &Cli) -> Result<()> {
+    async fn run_interactive(&mut self) -> Result<()> {
         output::write_stdout(&format!(
             "Connected to {} as {}. Type \\? for help.\n",
             output::safe_terminal_text(&self.database.info.database),
@@ -128,60 +113,65 @@ impl App {
         let metadata = load_startup_metadata(&self.database).await?;
         warn_if_metadata_truncated(&metadata);
         self.metadata.replace(metadata);
-        let mut editor = self.create_editor(cli)?;
+        let mut editor = self.create_editor()?;
+        // Set by a Ctrl-D inside a transaction; a second consecutive Ctrl-D
+        // then exits anyway.
         let mut exit_armed = false;
 
         loop {
             let info = &self.database.info;
             let prompt = SqlPrompt::new(&info.user, &info.host, &info.database, self.transaction);
             let signal = tokio::task::block_in_place(|| editor.read_line(&prompt))?;
-            let (next_exit_armed, should_exit) = exit_guard_transition(
-                exit_armed,
-                self.transaction,
-                matches!(&signal, Signal::CtrlD),
-            );
-            exit_armed = next_exit_armed;
-            if should_exit {
-                break;
+            if let Signal::CtrlD = signal {
+                if self.transaction == TransactionStatus::Idle || exit_armed {
+                    break;
+                }
+                exit_armed = true;
+                eprintln!("A transaction is active. Press Ctrl-D again to exit, or ROLLBACK;");
+                continue;
             }
+            exit_armed = false;
             match signal {
                 Signal::Success(input) => {
-                    if let Some(command) = commands::parse(&input) {
-                        let is_catalog = matches!(&command, SpecialCommand::Catalog(_));
-                        match self.handle_command(command).await {
-                            Ok(CommandOutcome::Exit) => break,
-                            Ok(CommandOutcome::RebuildEditor) => {
-                                editor = self.create_editor(cli)?;
-                            }
-                            Ok(CommandOutcome::ReplaceBuffer(query)) => {
-                                repl::replace_buffer(&mut editor, query);
-                            }
-                            Ok(CommandOutcome::Continue) => {}
-                            Err(AppError::InvalidCommand(message)) => {
-                                eprintln!("{}", output::safe_terminal_text(&message));
-                            }
-                            Err(error) => {
-                                let Some(db_error) = error.as_recoverable_db_error() else {
-                                    return Err(error);
-                                };
-                                if is_catalog {
-                                    self.note_catalog_failure();
-                                }
-                                eprintln!(
-                                    "PostgreSQL error: {}",
-                                    output::safe_terminal_text(&db_error.to_string())
-                                );
-                            }
+                    let Some(command) = commands::parse(&input) else {
+                        if !input.trim().is_empty() {
+                            self.run_query(&input, Mode::Repl).await?;
                         }
-                    } else if !input.trim().is_empty() {
-                        self.run_query(&input, Mode::Repl).await?;
+                        continue;
+                    };
+                    let is_catalog = matches!(&command, Ok(SpecialCommand::Catalog(_)));
+                    let outcome = match command {
+                        Ok(command) => self.handle_command(command).await,
+                        Err(error) => Err(error),
+                    };
+                    match outcome {
+                        Ok(CommandOutcome::Exit) => break,
+                        Ok(CommandOutcome::RebuildEditor) => {
+                            editor = self.create_editor()?;
+                        }
+                        Ok(CommandOutcome::ReplaceBuffer(query)) => {
+                            repl::replace_buffer(&mut editor, query);
+                        }
+                        Ok(CommandOutcome::Continue) => {}
+                        Err(AppError::InvalidCommand(message)) => {
+                            eprintln!("{}", output::safe_terminal_text(&message));
+                        }
+                        Err(error) => {
+                            let Some(db_error) = error.as_recoverable_db_error() else {
+                                return Err(error);
+                            };
+                            if is_catalog {
+                                self.note_catalog_failure();
+                            }
+                            eprintln!(
+                                "PostgreSQL error: {}",
+                                output::safe_terminal_text(&db_error.to_string())
+                            );
+                        }
                     }
                 }
                 Signal::CtrlC => {
                     output::write_stdout("^C\n")?;
-                }
-                Signal::CtrlD => {
-                    eprintln!("A transaction is active. Press Ctrl-D again to exit, or ROLLBACK;");
                 }
                 _ => {}
             }
@@ -193,7 +183,7 @@ impl App {
         match command {
             SpecialCommand::Help => output::write_stdout(commands::HELP)?,
             SpecialCommand::Quit => {
-                if !matches!(self.transaction, TransactionStatus::Idle) {
+                if self.transaction != TransactionStatus::Idle {
                     eprintln!(
                         "A transaction is active; run ROLLBACK; before quitting (Ctrl-D twice to force)."
                     );
@@ -222,52 +212,48 @@ impl App {
             }
             SpecialCommand::Refresh => self.refresh_metadata().await?,
             SpecialCommand::Connect(database) => return self.reconnect(&database).await,
-            SpecialCommand::Catalog(command) => {
-                let catalog = commands::catalog::run(
-                    &self.database.client,
-                    &command,
-                    commands::catalog::CatalogLimits {
-                        row_limit: self.row_limit,
-                        max_field_width: self.max_field_width.unwrap_or(500),
-                    },
-                );
-                match await_catalog_query(
-                    catalog,
-                    tokio::signal::ctrl_c(),
-                    &self.database.canceller(),
-                )
-                .await?
-                {
-                    CatalogQueryOutcome::Completed(rendered) => {
-                        tokio::task::block_in_place(|| output::write(&rendered, self.pager))?;
-                    }
-                    CatalogQueryOutcome::Cancelled {
-                        backend_cancelled, ..
-                    } => {
-                        let was_active = matches!(self.transaction, TransactionStatus::Active);
-                        if backend_cancelled {
-                            self.note_catalog_failure();
-                        }
-                        if was_active && backend_cancelled {
-                            eprintln!("Catalog query cancelled; transaction is now failed.");
-                        } else {
-                            eprintln!("Catalog query cancelled.");
-                        }
-                        return Ok(CommandOutcome::Continue);
-                    }
-                }
-            }
-            SpecialCommand::Invalid(message) => {
-                eprintln!("{}", output::safe_terminal_text(&message));
-            }
-            SpecialCommand::Unknown(name) => {
-                eprintln!(
-                    "Unknown command: \\{}. Type \\? for help.",
-                    output::safe_terminal_text(&name)
-                );
-            }
+            SpecialCommand::Catalog(command) => self.run_catalog_command(&command).await?,
         }
         Ok(CommandOutcome::Continue)
+    }
+
+    async fn run_catalog_command(&mut self, command: &CatalogCommand) -> Result<()> {
+        let catalog = commands::catalog::run(
+            &self.database.client,
+            command,
+            commands::catalog::CatalogLimits {
+                row_limit: self.cli.row_limit,
+                max_field_width: self.cli.max_field_width.unwrap_or(DEFAULT_MAX_FIELD_WIDTH),
+            },
+        );
+        let outcome = executor::await_cancellable_query(
+            catalog,
+            tokio::signal::ctrl_c(),
+            None,
+            CATALOG_DRAIN_TIMEOUT,
+            &self.database.canceller(),
+            "catalog query",
+        )
+        .await?;
+        match outcome {
+            CancellableQueryOutcome::Completed(rendered) => {
+                tokio::task::block_in_place(|| output::write(&rendered, self.pager))?;
+            }
+            CancellableQueryOutcome::Cancelled {
+                backend_cancelled, ..
+            } => {
+                let was_active = self.transaction == TransactionStatus::Active;
+                if backend_cancelled {
+                    self.note_catalog_failure();
+                }
+                if was_active && backend_cancelled {
+                    eprintln!("Catalog query cancelled; transaction is now failed.");
+                } else {
+                    eprintln!("Catalog query cancelled.");
+                }
+            }
+        }
+        Ok(())
     }
 
     /// A catalog-flavored query failed or was cancelled on the server, which
@@ -278,12 +264,12 @@ impl App {
 
     async fn refresh_metadata(&mut self) -> Result<()> {
         match await_metadata_load(&self.database).await {
-            Ok(executor::CancellableQueryOutcome::Completed(metadata)) => {
+            Ok(CancellableQueryOutcome::Completed(metadata)) => {
                 warn_if_metadata_truncated(&metadata);
                 self.metadata.replace(metadata);
                 output::write_stdout("Completion metadata refreshed.\n")?;
             }
-            Ok(executor::CancellableQueryOutcome::Cancelled {
+            Ok(CancellableQueryOutcome::Cancelled {
                 reason,
                 backend_cancelled,
             }) => {
@@ -326,8 +312,8 @@ impl App {
             }
         };
         let metadata = match await_metadata_load(&new_database).await {
-            Ok(executor::CancellableQueryOutcome::Completed(metadata)) => metadata,
-            Ok(executor::CancellableQueryOutcome::Cancelled { reason, .. }) => {
+            Ok(CancellableQueryOutcome::Completed(metadata)) => metadata,
+            Ok(CancellableQueryOutcome::Cancelled { reason, .. }) => {
                 eprintln!(
                     "Connection setup failed: {}; previous connection retained.",
                     output::safe_terminal_text(&reason)
@@ -353,6 +339,10 @@ impl App {
         Ok(CommandOutcome::RebuildEditor)
     }
 
+    fn layout(&self) -> Layout {
+        Layout::new(self.cli.format, self.expanded)
+    }
+
     async fn run_query(&mut self, sql: &str, mode: Mode) -> Result<()> {
         self.last_query = Some(sql.to_owned());
         let standard_conforming_strings = self
@@ -360,57 +350,47 @@ impl App {
             .standard_conforming_strings
             .load(Ordering::Relaxed);
         if let Some(error) = unsupported_copy_error(sql, standard_conforming_strings) {
-            if mode == Mode::Repl {
-                eprintln!("{}", output::safe_terminal_text(&error.to_string()));
-                return Ok(());
-            }
-            return Err(error);
+            // Nothing was sent to the server, so the session is intact.
+            return report_or_fail(mode, error, true);
         }
-        let max_field_width =
-            effective_max_field_width(self.format, self.expanded, self.max_field_width);
         let query_started = Instant::now();
-        let execution = match self.execute_sql(sql, mode, max_field_width).await {
+        let execution = match self.execute_sql(sql, mode).await {
             Ok(execution) => execution,
             Err(error) => {
                 self.transaction =
                     transaction::after_error(self.transaction, sql, 0, standard_conforming_strings);
-                if mode == Mode::Repl && error.as_recoverable_db_error().is_some() {
-                    eprintln!("{}", output::safe_terminal_text(&error.to_string()));
-                    return Ok(());
-                }
-                return Err(error);
+                let recoverable = error.as_recoverable_db_error().is_some();
+                return report_or_fail(mode, error, recoverable);
             }
         };
 
-        self.update_transaction_after_execution(
-            sql,
-            execution.completed_statements,
-            execution.error.is_some(),
-            standard_conforming_strings,
-        );
+        self.transaction = if execution.error.is_some() {
+            transaction::after_error(
+                self.transaction,
+                sql,
+                execution.completed_statements,
+                standard_conforming_strings,
+            )
+        } else {
+            transaction::after_success(self.transaction, sql, standard_conforming_strings)
+        };
         self.present_execution(&execution, query_started.elapsed())?;
 
-        if let Some(error) = execution.error {
-            let error = AppError::Postgres(error);
-            if mode == Mode::Repl && error.as_recoverable_db_error().is_some() {
-                eprintln!("{}", output::safe_terminal_text(&error.to_string()));
-                Ok(())
-            } else {
-                Err(error)
+        match execution.error {
+            Some(error) => {
+                let error = AppError::Postgres(error);
+                let recoverable = error.as_recoverable_db_error().is_some();
+                report_or_fail(mode, error, recoverable)
             }
-        } else {
-            Ok(())
+            None => Ok(()),
         }
     }
-    async fn execute_sql(
-        &self,
-        sql: &str,
-        mode: Mode,
-        max_field_width: usize,
-    ) -> Result<executor::Execution> {
-        let stream_machine =
-            !self.expanded && matches!(self.format, OutputFormat::Csv | OutputFormat::Tsv);
-        let (output_sink, stream_writer) = if mode == Mode::Repl && !stream_machine {
+
+    async fn execute_sql(&self, sql: &str, mode: Mode) -> Result<executor::Execution> {
+        let layout = self.layout();
+        // The REPL buffers human output so it can be paged; everything else
+        // streams to stdout as statements complete.
+        let (output_sink, writer) = if mode == Mode::Repl && !layout.is_machine_readable() {
             (None, None)
         } else {
             let (sink, writer) = output::stream_writer();
@@ -421,39 +401,20 @@ impl App {
             &self.database.canceller(),
             sql,
             executor::ExecutionOptions {
-                format: self.format,
+                format: self.cli.format,
                 expanded: self.expanded,
-                row_limit: self.row_limit,
-                max_field_width,
+                row_limit: self.cli.row_limit,
+                max_field_width: effective_max_field_width(layout, self.cli.max_field_width),
             },
             output_sink.as_ref(),
         )
         .await;
+        // Closing the sink lets the writer thread drain and exit.
         drop(output_sink);
-        let writer = match stream_writer {
-            Some(writer) => writer.finish().await,
-            None => Ok(()),
-        };
-        writer.and(execution)
-    }
-
-    fn update_transaction_after_execution(
-        &mut self,
-        sql: &str,
-        completed_statements: usize,
-        failed: bool,
-        standard_conforming_strings: bool,
-    ) {
-        self.transaction = if failed {
-            transaction::after_error(
-                self.transaction,
-                sql,
-                completed_statements,
-                standard_conforming_strings,
-            )
-        } else {
-            transaction::after_success(self.transaction, sql, standard_conforming_strings)
-        };
+        if let Some(writer) = writer {
+            writer.await??;
+        }
+        execution
     }
 
     fn present_execution(&self, execution: &executor::Execution, elapsed: Duration) -> Result<()> {
@@ -466,7 +427,7 @@ impl App {
         if !self.timing {
             return Ok(());
         }
-        if matches!(self.format, OutputFormat::Csv | OutputFormat::Tsv) && !self.expanded {
+        if self.layout().is_machine_readable() {
             eprintln!("Time: {}", format_duration(elapsed));
         } else {
             output::write_stdout(&format!("Time: {}\n", format_duration(elapsed)))?;
@@ -475,13 +436,20 @@ impl App {
     }
 }
 
-const METADATA_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
-const CATALOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// At the REPL a recoverable failure is printed and the prompt returns; a
+/// one-shot run, or an unrecoverable failure, ends the process instead.
+fn report_or_fail(mode: Mode, error: AppError, recoverable: bool) -> Result<()> {
+    if mode == Mode::Repl && recoverable {
+        eprintln!("{}", output::safe_terminal_text(&error.to_string()));
+        return Ok(());
+    }
+    Err(error)
+}
 
 async fn load_startup_metadata(database: &Database) -> Result<Metadata> {
     match await_metadata_load(database).await {
-        Ok(executor::CancellableQueryOutcome::Completed(metadata)) => Ok(metadata),
-        Ok(executor::CancellableQueryOutcome::Cancelled { reason, .. }) => {
+        Ok(CancellableQueryOutcome::Completed(metadata)) => Ok(metadata),
+        Ok(CancellableQueryOutcome::Cancelled { reason, .. }) => {
             eprintln!(
                 "warning: metadata completion unavailable: {}",
                 output::safe_terminal_text(&reason)
@@ -501,9 +469,7 @@ async fn load_startup_metadata(database: &Database) -> Result<Metadata> {
     }
 }
 
-async fn await_metadata_load(
-    database: &Database,
-) -> Result<executor::CancellableQueryOutcome<Metadata>> {
+async fn await_metadata_load(database: &Database) -> Result<CancellableQueryOutcome<Metadata>> {
     executor::await_cancellable_query(
         Metadata::load(&database.client),
         tokio::signal::ctrl_c(),
@@ -521,54 +487,13 @@ fn warn_if_metadata_truncated(metadata: &Metadata) {
     }
 }
 
-fn exit_guard_transition(
-    armed: bool,
-    transaction: TransactionStatus,
-    ctrl_d: bool,
-) -> (bool, bool) {
-    if !ctrl_d {
-        return (false, false);
-    }
-    if transaction == TransactionStatus::Idle || armed {
-        (false, true)
+/// Machine-readable output keeps whole fields unless a width was asked for;
+/// human output truncates long fields by default.
+fn effective_max_field_width(layout: Layout, configured: Option<usize>) -> usize {
+    configured.unwrap_or(if layout.is_machine_readable() {
+        0
     } else {
-        (true, false)
-    }
-}
-
-type CatalogQueryOutcome<T> = executor::CancellableQueryOutcome<T>;
-
-async fn await_catalog_query<T, Query, Interrupt>(
-    query: Query,
-    interrupt: Interrupt,
-    canceller: &executor::Canceller,
-) -> Result<CatalogQueryOutcome<T>>
-where
-    Query: Future<Output = Result<T>>,
-    Interrupt: Future<Output = io::Result<()>>,
-{
-    executor::await_cancellable_query(
-        query,
-        interrupt,
-        None,
-        CATALOG_DRAIN_TIMEOUT,
-        canceller,
-        "catalog query",
-    )
-    .await
-}
-
-fn effective_max_field_width(
-    format: OutputFormat,
-    expanded: bool,
-    configured: Option<usize>,
-) -> usize {
-    configured.unwrap_or({
-        if matches!(format, OutputFormat::Csv | OutputFormat::Tsv) && !expanded {
-            0
-        } else {
-            500
-        }
+        DEFAULT_MAX_FIELD_WIDTH
     })
 }
 
@@ -587,29 +512,18 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn transaction_exit_confirmation_must_be_consecutive() {
-        let (armed, exit) = exit_guard_transition(false, TransactionStatus::Active, true);
-        assert!(armed);
-        assert!(!exit);
-        let (armed, exit) = exit_guard_transition(armed, TransactionStatus::Active, false);
-        assert!(!armed);
-        assert!(!exit);
-        assert_eq!(
-            exit_guard_transition(armed, TransactionStatus::Active, true),
-            (true, false)
-        );
-        assert_eq!(
-            exit_guard_transition(true, TransactionStatus::Active, true),
-            (false, true)
-        );
-    }
+    use crate::{
+        cli::OutputFormat,
+        test_support::{
+            assert_connection_usable, backend_pid, connect, connect_with_cli,
+            wait_until_query_active,
+        },
+    };
 
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn reconnect_switches_database_and_replaces_metadata() {
-        let (cli, database) = crate::test_support::connect_with_cli(&[]).await;
+        let (cli, database) = connect_with_cli(&[]).await;
         let Some(target_database) = database
             .client
             .query_opt(
@@ -626,7 +540,7 @@ mod tests {
         else {
             return;
         };
-        let mut app = App::new(&cli, database);
+        let mut app = App::new(cli, database);
         app.metadata.replace(Metadata {
             relations: vec!["stale_relation".into()],
             ..Metadata::default()
@@ -653,9 +567,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn failed_reconnect_retains_the_current_connection() {
-        let (cli, database) = crate::test_support::connect_with_cli(&[]).await;
+        let (cli, database) = connect_with_cli(&[]).await;
         let original_database = database.info.database.clone();
-        let mut app = App::new(&cli, database);
+        let mut app = App::new(cli, database);
 
         let outcome = app
             .reconnect("pgline_database_that_does_not_exist")
@@ -664,21 +578,13 @@ mod tests {
 
         assert_eq!(outcome, CommandOutcome::Continue);
         assert_eq!(app.database.info.database, original_database);
-        assert_eq!(
-            app.database
-                .client
-                .query_one("SELECT 1", &[])
-                .await
-                .unwrap()
-                .get::<_, i32>(0),
-            1
-        );
+        assert_connection_usable(&app.database.client).await;
     }
 
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn refresh_replaces_completion_metadata() {
-        let (cli, database) = crate::test_support::connect_with_cli(&[]).await;
+        let (cli, database) = connect_with_cli(&[]).await;
         database
             .client
             .batch_execute(
@@ -687,7 +593,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let mut app = App::new(&cli, database);
+        let mut app = App::new(cli, database);
 
         assert_eq!(
             app.handle_command(SpecialCommand::Refresh).await.unwrap(),
@@ -707,69 +613,52 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn cancelled_catalog_query_finishes_before_connection_reuse() {
-        let database = crate::test_support::connect().await;
-        let observer = crate::test_support::connect().await;
-        let pid: i32 = database
-            .client
-            .query_one("SELECT pg_backend_pid()", &[])
-            .await
-            .unwrap()
-            .get(0);
-        let canceller = database.canceller();
+        let database = connect().await;
+        let observer = connect().await;
+        let pid = backend_pid(&database.client).await;
         let query = async {
             database.client.query("SELECT pg_sleep(30)", &[]).await?;
             Ok::<(), AppError>(())
         };
         let interrupt = async {
-            tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    let active: bool = observer
-                        .client
-                        .query_one(
-                            "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
-                             WHERE pid = $1 AND state = 'active' \
-                               AND query LIKE '%pg_sleep(30)%')",
-                            &[&pid],
-                        )
-                        .await
-                        .unwrap()
-                        .get(0);
-                    if active {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-            })
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                wait_until_query_active(&observer.client, pid, "pg_sleep(30)"),
+            )
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "query did not become active"))
         };
 
-        let outcome = await_catalog_query(query, interrupt, &canceller)
-            .await
-            .unwrap();
+        let outcome = executor::await_cancellable_query(
+            query,
+            interrupt,
+            None,
+            CATALOG_DRAIN_TIMEOUT,
+            &database.canceller(),
+            "catalog query",
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             outcome,
-            CatalogQueryOutcome::Cancelled {
+            CancellableQueryOutcome::Cancelled {
                 backend_cancelled: true,
                 ..
             }
         ));
-        let value: i32 = tokio::time::timeout(
+        tokio::time::timeout(
             Duration::from_secs(2),
-            database.client.query_one("SELECT 1", &[]),
+            assert_connection_usable(&database.client),
         )
         .await
-        .expect("connection remained busy after catalog cancellation")
-        .unwrap()
-        .get(0);
-        assert_eq!(value, 1);
+        .expect("connection remained busy after catalog cancellation");
     }
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn rejected_copy_protocol_forms_leave_connection_usable() {
-        let (cli, database) = crate::test_support::connect_with_cli(&["--no-pager"]).await;
-        let mut app = App::new(&cli, database);
+        let (cli, database) = connect_with_cli(&["--no-pager"]).await;
+        let mut app = App::new(cli, database);
         let atomic_batch = "CREATE FUNCTION pg_temp.pgline_copy_guard() RETURNS int LANGUAGE SQL \
              BEGIN ATOMIC SELECT 1; END; COPY (SELECT 1) TO STDOUT";
         assert!(matches!(
@@ -800,22 +689,15 @@ mod tests {
                 Err(AppError::Unsupported(_))
             ));
             assert!(app.run_query(sql, Mode::Repl).await.is_ok());
-            let value: i32 = app
-                .database
-                .client
-                .query_one("SELECT 1", &[])
-                .await
-                .unwrap()
-                .get(0);
-            assert_eq!(value, 1);
+            assert_connection_usable(&app.database.client).await;
         }
     }
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn failed_commit_leaves_transaction_state_unknown() {
-        let (cli, database) = crate::test_support::connect_with_cli(&["--no-pager"]).await;
-        let mut app = App::new(&cli, database);
+        let (cli, database) = connect_with_cli(&["--no-pager"]).await;
+        let mut app = App::new(cli, database);
         app.run_query(
             "CREATE TEMP TABLE pgline_deferred_unique(\
                  value int, UNIQUE(value) DEFERRABLE INITIALLY DEFERRED)",
@@ -832,23 +714,15 @@ mod tests {
         .unwrap();
         app.run_query("COMMIT", Mode::Repl).await.unwrap();
         assert_eq!(app.transaction, TransactionStatus::Unknown);
-        assert_eq!(
-            app.database
-                .client
-                .query_one("SELECT 1", &[])
-                .await
-                .unwrap()
-                .get::<_, i32>(0),
-            1
-        );
+        assert_connection_usable(&app.database.client).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn parameter_status_survives_a_later_batch_error() {
-        let (cli, database) = crate::test_support::connect_with_cli(&["--no-pager"]).await;
+        let (cli, database) = connect_with_cli(&["--no-pager"]).await;
         let setting = Arc::clone(&database.standard_conforming_strings);
-        let mut app = App::new(&cli, database);
+        let mut app = App::new(cli, database);
         app.run_query(
             "SET standard_conforming_strings = off; COMMIT; SELECT missing_column",
             Mode::Repl,
@@ -877,12 +751,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn notices_do_not_deadlock_streamed_output() {
-        let _ = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .without_time()
-            .try_init();
-        let (cli, database) = crate::test_support::connect_with_cli(&["--no-pager"]).await;
-        let mut app = App::new(&cli, database);
+        let (cli, database) = connect_with_cli(&["--no-pager"]).await;
+        let mut app = App::new(cli, database);
         tokio::time::timeout(
             Duration::from_secs(2),
             app.run_query(
@@ -898,16 +768,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn closed_connections_fail_metadata_loading() {
-        let (cli, refresh_database) = crate::test_support::connect_with_cli(&[]).await;
+        let (cli, refresh_database) = connect_with_cli(&[]).await;
         let startup_database = crate::connection::connect(&cli).await.unwrap();
         let killer = crate::connection::connect(&cli).await.unwrap();
         for database in [&refresh_database, &startup_database] {
-            let pid: i32 = database
-                .client
-                .query_one("SELECT pg_backend_pid()", &[])
-                .await
-                .unwrap()
-                .get(0);
+            let pid = backend_pid(&database.client).await;
             assert!(
                 killer
                     .client
@@ -919,7 +784,7 @@ mod tests {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
 
-        let mut app = App::new(&cli, refresh_database);
+        let mut app = App::new(cli, refresh_database);
         let refresh_error = app
             .refresh_metadata()
             .await
@@ -935,13 +800,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires PGLINE_TEST_URL"]
     async fn closed_query_connection_exits_interactive_execution() {
-        let (cli, database) = crate::test_support::connect_with_cli(&["--no-pager"]).await;
-        let pid: i32 = database
-            .client
-            .query_one("SELECT pg_backend_pid()", &[])
-            .await
-            .unwrap()
-            .get(0);
+        let (cli, database) = connect_with_cli(&["--no-pager"]).await;
+        let pid = backend_pid(&database.client).await;
         let killer = crate::connection::connect(&cli).await.unwrap();
         assert!(
             killer
@@ -953,7 +813,7 @@ mod tests {
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
 
-        let mut app = App::new(&cli, database);
+        let mut app = App::new(cli, database);
         let error = app
             .run_query("SELECT 1", Mode::Repl)
             .await
@@ -963,23 +823,14 @@ mod tests {
 
     #[test]
     fn machine_output_defaults_follow_expanded_mode() {
-        assert_eq!(effective_max_field_width(OutputFormat::Csv, false, None), 0);
-        assert_eq!(
-            effective_max_field_width(OutputFormat::Csv, true, None),
-            500
-        );
-        assert_eq!(
-            effective_max_field_width(OutputFormat::Table, false, None),
-            500
-        );
-        assert_eq!(
-            effective_max_field_width(OutputFormat::Csv, false, Some(12)),
-            12
-        );
-        assert_eq!(
-            effective_max_field_width(OutputFormat::Csv, true, Some(12)),
-            12
-        );
+        let csv = Layout::new(OutputFormat::Csv, false);
+        let expanded_csv = Layout::new(OutputFormat::Csv, true);
+        let table = Layout::new(OutputFormat::Table, false);
+        assert_eq!(effective_max_field_width(csv, None), 0);
+        assert_eq!(effective_max_field_width(expanded_csv, None), 500);
+        assert_eq!(effective_max_field_width(table, None), 500);
+        assert_eq!(effective_max_field_width(csv, Some(12)), 12);
+        assert_eq!(effective_max_field_width(expanded_csv, Some(12)), 12);
     }
 
     #[test]

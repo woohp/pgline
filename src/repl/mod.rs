@@ -70,7 +70,7 @@ pub fn create_editor(
             !cli.no_color,
             Arc::clone(&standard_conforming_strings),
         )))
-        .with_completer(Box::new(SqlCompleter::with_standard_conforming_strings(
+        .with_completer(Box::new(SqlCompleter::new(
             metadata,
             standard_conforming_strings,
         )))
@@ -133,7 +133,7 @@ pub struct SqlValidator {
 
 impl Validator for SqlValidator {
     fn validate(&self, line: &str) -> ValidationResult {
-        if scanner::is_complete_with_standard_conforming_strings(
+        if scanner::is_complete(
             line,
             self.standard_conforming_strings.load(Ordering::Relaxed),
         ) {

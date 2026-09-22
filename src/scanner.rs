@@ -21,14 +21,7 @@ pub struct ScanResult {
     pub balanced: bool,
 }
 
-pub fn scan(input: &str) -> ScanResult {
-    scan_with_standard_conforming_strings(input, true)
-}
-
-pub fn scan_with_standard_conforming_strings(
-    input: &str,
-    standard_conforming_strings: bool,
-) -> ScanResult {
+pub fn scan(input: &str, standard_conforming_strings: bool) -> ScanResult {
     let bytes = input.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -215,20 +208,12 @@ pub fn scan_with_standard_conforming_strings(
     }
 }
 
-#[cfg(test)]
-pub fn is_complete(input: &str) -> bool {
-    is_complete_with_standard_conforming_strings(input, true)
-}
-
-pub fn is_complete_with_standard_conforming_strings(
-    input: &str,
-    standard_conforming_strings: bool,
-) -> bool {
+pub fn is_complete(input: &str, standard_conforming_strings: bool) -> bool {
     let trimmed = input.trim_start();
     if trimmed.is_empty() || trimmed.starts_with('\\') {
         return true;
     }
-    scan_with_standard_conforming_strings(input, standard_conforming_strings).balanced
+    scan(input, standard_conforming_strings).balanced
 }
 
 pub fn word_at(input: &str, cursor: usize) -> (usize, &str) {
@@ -410,34 +395,28 @@ mod tests {
 
     #[test]
     fn completeness_depends_on_balanced_syntax_not_semicolons() {
-        assert!(is_complete("select 1"));
-        assert!(is_complete("select ';'"));
-        assert!(!is_complete("select '"));
-        assert!(is_complete("select ';'; -- done"));
-        assert!(is_complete("-- comment only"));
-        assert!(!is_complete("select 1 /* unfinished"));
-        assert!(is_complete(r"SELECT E'it\'s valid'"));
-        assert!(is_complete(r"SELECT E'backslash: \\'"));
-        assert!(is_complete("SELECT E'multiline\\\nstill valid'"));
-        assert!(!is_complete("SELECT E'multiline\\\nstill open"));
-        assert!(is_complete_with_standard_conforming_strings(
-            r"SELECT 'it\'s valid'",
-            false,
-        ));
-        assert!(!is_complete_with_standard_conforming_strings(
-            r"SELECT 'it\'s valid'",
-            true,
-        ));
+        assert!(is_complete("select 1", true));
+        assert!(is_complete("select ';'", true));
+        assert!(!is_complete("select '", true));
+        assert!(is_complete("select ';'; -- done", true));
+        assert!(is_complete("-- comment only", true));
+        assert!(!is_complete("select 1 /* unfinished", true));
+        assert!(is_complete(r"SELECT E'it\'s valid'", true));
+        assert!(is_complete(r"SELECT E'backslash: \\'", true));
+        assert!(is_complete("SELECT E'multiline\\\nstill valid'", true));
+        assert!(!is_complete("SELECT E'multiline\\\nstill open", true));
+        assert!(is_complete(r"SELECT 'it\'s valid'", false,));
+        assert!(!is_complete(r"SELECT 'it\'s valid'", true,));
     }
 
     #[test]
     fn completeness_handles_dollar_quotes_and_parentheses() {
-        assert!(is_complete("do $$ begin raise notice ';'; end $$;"));
-        assert!(!is_complete("select (1;"));
-        assert!(is_complete("select 1)"));
-        assert!(is_complete("select 1))"));
-        assert!(!is_complete("select $tag$unfinished;"));
-        assert!(is_complete("select $标签$not syntax$标签$"));
+        assert!(is_complete("do $$ begin raise notice ';'; end $$;", true));
+        assert!(!is_complete("select (1;", true));
+        assert!(is_complete("select 1)", true));
+        assert!(is_complete("select 1))", true));
+        assert!(!is_complete("select $tag$unfinished;", true));
+        assert!(is_complete("select $标签$not syntax$标签$", true));
         assert_eq!(dollar_delimiter_end("$💥$", 0), None);
         assert_eq!(dollar_delimiter_end("$·$", 0), None);
         assert_eq!(dollar_delimiter_end("$标签$", 0), Some("$标签$".len()));
@@ -445,8 +424,8 @@ mod tests {
 
     #[test]
     fn nested_comments_are_balanced() {
-        assert!(is_complete("/* outer /* inner */ done */ select 1;"));
-        assert!(!is_complete("/* unfinished select 1;"));
+        assert!(is_complete("/* outer /* inner */ done */ select 1;", true));
+        assert!(!is_complete("/* unfinished select 1;", true));
     }
 
     #[test]
@@ -454,6 +433,6 @@ mod tests {
         assert_eq!(word_at("select use", 10), (7, "use"));
         assert_eq!(word_at("schema.tab", 10), (7, "tab"));
         assert_eq!(word_at("select café", 12), (7, "café"));
-        assert_eq!(scan("select café;").tokens.last().unwrap().end, 13);
+        assert_eq!(scan("select café;", true).tokens.last().unwrap().end, 13);
     }
 }

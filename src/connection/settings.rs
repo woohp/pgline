@@ -9,24 +9,6 @@ use crate::{
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[cfg(test)]
-fn has_mixed_host_types(config: &Config) -> bool {
-    #[cfg(unix)]
-    {
-        let has_unix = config
-            .get_hosts()
-            .iter()
-            .any(|host| matches!(host, tokio_postgres::config::Host::Unix(_)));
-        let has_tcp = config
-            .get_hosts()
-            .iter()
-            .any(|host| matches!(host, tokio_postgres::config::Host::Tcp(_)));
-        has_unix && has_tcp
-    }
-    #[cfg(not(unix))]
-    false
-}
-
 pub(super) fn connection_target_count(config: &Config) -> usize {
     config
         .get_hosts()
@@ -82,19 +64,8 @@ pub(super) fn config_for_target(original: &Config, index: usize) -> Config {
     config
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConnectionInput {
-    DatabaseName,
-    Uri,
-    Keywords,
-}
-
 pub(super) fn base_config(cli: &Cli) -> Result<Config> {
-    let connection_input = cli
-        .connection
-        .as_deref()
-        .map_or(ConnectionInput::DatabaseName, classify_connection_input);
-    let is_dsn = connection_input != ConnectionInput::DatabaseName;
+    let is_dsn = cli.connection.as_deref().is_some_and(looks_like_dsn);
     let dsn_has_sslmode = is_dsn
         && cli
             .connection
@@ -131,7 +102,9 @@ pub(super) fn base_config(cli: &Cli) -> Result<Config> {
     Ok(config)
 }
 
-fn classify_connection_input(value: &str) -> ConnectionInput {
+/// Whether the positional argument is a URI or keyword connection string
+/// rather than a bare database name.
+fn looks_like_dsn(value: &str) -> bool {
     let trimmed = value.trim_start();
     let scheme_end = trimmed.find(':').unwrap_or(0);
     if scheme_end != 0
@@ -141,7 +114,7 @@ fn classify_connection_input(value: &str) -> ConnectionInput {
         )
         && trimmed[scheme_end..].starts_with("://")
     {
-        return ConnectionInput::Uri;
+        return true;
     }
 
     let key_end = trimmed
@@ -149,11 +122,7 @@ fn classify_connection_input(value: &str) -> ConnectionInput {
         .unwrap_or(trimmed.len());
     let key = &trimmed[..key_end];
     let has_equals = trimmed[key_end..].trim_start().starts_with('=');
-    if has_equals && is_connection_keyword(key) {
-        ConnectionInput::Keywords
-    } else {
-        ConnectionInput::DatabaseName
-    }
+    has_equals && is_connection_keyword(key)
 }
 
 fn is_connection_keyword(value: &str) -> bool {
@@ -571,10 +540,7 @@ mod tests {
         }
 
         for dsn in ["host=db.example dbname=app", "postgresql://db.example/app"] {
-            assert_ne!(
-                classify_connection_input(dsn),
-                ConnectionInput::DatabaseName
-            );
+            assert!(looks_like_dsn(dsn));
         }
     }
 
@@ -782,7 +748,6 @@ mod tests {
         config.host("/tmp");
         config.host("db.example");
         config.ssl_mode(SslMode::Require);
-        assert!(has_mixed_host_types(&config));
 
         let socket = config_for_target(&config, 0);
         assert!(uses_no_tls(&socket));

@@ -53,65 +53,76 @@ pub enum SpecialCommand {
     Refresh,
     Connect(String),
     Catalog(CatalogCommand),
-    Invalid(String),
-    Unknown(String),
 }
 
-pub fn parse(input: &str) -> Option<SpecialCommand> {
+/// Recognises a backslash command. `None` means the input is SQL; an `Err`
+/// is an [`AppError::InvalidCommand`] describing what was wrong with it.
+pub fn parse(input: &str) -> Option<Result<SpecialCommand>> {
     let input = input.trim();
     let rest = input.strip_prefix('\\')?;
     let (name, argument) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     let argument = argument.trim();
     let pattern = || (!argument.is_empty()).then(|| argument.to_owned());
+    let verbose = name.ends_with('+');
+    let relations = |kind| {
+        Ok(SpecialCommand::Catalog(CatalogCommand::ListRelations {
+            kind,
+            pattern: pattern(),
+            verbose,
+        }))
+    };
 
     Some(match name {
         "?" | "h" => no_argument(name, argument, SpecialCommand::Help),
         "q" | "quit" => no_argument(name, argument, SpecialCommand::Quit),
-        "e" => SpecialCommand::Edit(pattern()),
+        "e" => Ok(SpecialCommand::Edit(pattern())),
         "x" => parse_toggle("x", argument, SpecialCommand::Expanded),
         "timing" => parse_toggle("timing", argument, SpecialCommand::Timing),
         "pager" => parse_toggle("pager", argument, SpecialCommand::Pager),
         "refresh" => no_argument(name, argument, SpecialCommand::Refresh),
-        "c" | "connect" => required_argument(name, argument, SpecialCommand::Connect),
-        "d" | "d+" => SpecialCommand::Catalog(CatalogCommand::Describe {
+        "c" | "connect" if argument.is_empty() => {
+            invalid(format!("\\{name} requires a database name"))
+        }
+        "c" | "connect" => Ok(SpecialCommand::Connect(argument.to_owned())),
+        "d" | "d+" => Ok(SpecialCommand::Catalog(CatalogCommand::Describe {
             pattern: pattern(),
-            verbose: name.ends_with('+'),
-        }),
-        "dt" | "dt+" => catalog_relations(RelationKind::Table, pattern(), name),
-        "dv" | "dv+" => catalog_relations(RelationKind::View, pattern(), name),
-        "dm" | "dm+" => catalog_relations(RelationKind::MaterializedView, pattern(), name),
-        "di" | "di+" => catalog_relations(RelationKind::Index, pattern(), name),
-        "ds" | "ds+" => catalog_relations(RelationKind::Sequence, pattern(), name),
-        "df" => SpecialCommand::Catalog(CatalogCommand::Functions { pattern: pattern() }),
-        "dn" => SpecialCommand::Catalog(CatalogCommand::Schemas { pattern: pattern() }),
-        "l" => SpecialCommand::Catalog(CatalogCommand::Databases { pattern: pattern() }),
-        "du" => SpecialCommand::Catalog(CatalogCommand::Roles { pattern: pattern() }),
+            verbose,
+        })),
+        "dt" | "dt+" => relations(RelationKind::Table),
+        "dv" | "dv+" => relations(RelationKind::View),
+        "dm" | "dm+" => relations(RelationKind::MaterializedView),
+        "di" | "di+" => relations(RelationKind::Index),
+        "ds" | "ds+" => relations(RelationKind::Sequence),
+        "df" => Ok(SpecialCommand::Catalog(CatalogCommand::Functions {
+            pattern: pattern(),
+        })),
+        "dn" => Ok(SpecialCommand::Catalog(CatalogCommand::Schemas {
+            pattern: pattern(),
+        })),
+        "l" => Ok(SpecialCommand::Catalog(CatalogCommand::Databases {
+            pattern: pattern(),
+        })),
+        "du" => Ok(SpecialCommand::Catalog(CatalogCommand::Roles {
+            pattern: pattern(),
+        })),
         "conninfo" => no_argument(
             name,
             argument,
             SpecialCommand::Catalog(CatalogCommand::ConnectionInfo),
         ),
-        _ => SpecialCommand::Unknown(name.to_owned()),
+        _ => invalid(format!("unknown command: \\{name}. Type \\? for help.")),
     })
 }
 
-fn no_argument(name: &str, argument: &str, command: SpecialCommand) -> SpecialCommand {
-    if argument.is_empty() {
-        command
-    } else {
-        SpecialCommand::Invalid(format!("\\{name} does not accept arguments"))
-    }
+fn invalid(message: String) -> Result<SpecialCommand> {
+    Err(AppError::InvalidCommand(message))
 }
 
-fn required_argument(
-    name: &str,
-    argument: &str,
-    command: impl FnOnce(String) -> SpecialCommand,
-) -> SpecialCommand {
+fn no_argument(name: &str, argument: &str, command: SpecialCommand) -> Result<SpecialCommand> {
     if argument.is_empty() {
-        SpecialCommand::Invalid(format!("\\{name} requires a database name"))
+        Ok(command)
     } else {
-        command(argument.to_owned())
+        invalid(format!("\\{name} does not accept arguments"))
     }
 }
 
@@ -119,21 +130,13 @@ fn parse_toggle(
     name: &str,
     argument: &str,
     command: impl FnOnce(Option<bool>) -> SpecialCommand,
-) -> SpecialCommand {
+) -> Result<SpecialCommand> {
     match argument.to_ascii_lowercase().as_str() {
-        "" => command(None),
-        "on" => command(Some(true)),
-        "off" => command(Some(false)),
-        _ => SpecialCommand::Invalid(format!("\\{name} expects on or off")),
+        "" => Ok(command(None)),
+        "on" => Ok(command(Some(true))),
+        "off" => Ok(command(Some(false))),
+        _ => invalid(format!("\\{name} expects on or off")),
     }
-}
-
-fn catalog_relations(kind: RelationKind, pattern: Option<String>, name: &str) -> SpecialCommand {
-    SpecialCommand::Catalog(CatalogCommand::ListRelations {
-        kind,
-        pattern,
-        verbose: name.ends_with('+'),
-    })
 }
 
 pub fn edit_query(initial: &str) -> Result<Option<String>> {
@@ -193,73 +196,73 @@ Ctrl-C clears input or cancels a query. Semicolons are optional for a single sta
 mod tests {
     use super::*;
 
+    fn command(input: &str) -> SpecialCommand {
+        parse(input).expect("a backslash command").unwrap()
+    }
+
+    fn rejection(input: &str) -> String {
+        match parse(input).expect("a backslash command") {
+            Err(AppError::InvalidCommand(message)) => message,
+            other => panic!("expected an invalid command, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parses_commands_and_toggles() {
-        assert_eq!(parse("\\q"), Some(SpecialCommand::Quit));
+        assert_eq!(command("\\q"), SpecialCommand::Quit);
+        assert_eq!(command(" \\x on "), SpecialCommand::Expanded(Some(true)));
+        assert_eq!(command("\\timing"), SpecialCommand::Timing(None));
+        assert_eq!(command("\\refresh"), SpecialCommand::Refresh);
         assert_eq!(
-            parse("\\q unexpected"),
-            Some(SpecialCommand::Invalid(
-                "\\q does not accept arguments".into()
-            ))
+            command("\\c analytics"),
+            SpecialCommand::Connect("analytics".into())
         );
-        assert!(matches!(
-            parse("\\? unexpected"),
-            Some(SpecialCommand::Invalid(_))
-        ));
-        assert!(matches!(
-            parse("\\conninfo unexpected"),
-            Some(SpecialCommand::Invalid(_))
-        ));
-        assert_eq!(
-            parse(" \\x on "),
-            Some(SpecialCommand::Expanded(Some(true)))
-        );
-        assert_eq!(parse("\\timing"), Some(SpecialCommand::Timing(None)));
-        assert_eq!(parse("\\refresh"), Some(SpecialCommand::Refresh));
-        assert_eq!(
-            parse("\\c analytics"),
-            Some(SpecialCommand::Connect("analytics".into()))
-        );
-        assert!(matches!(parse("\\c"), Some(SpecialCommand::Invalid(_))));
-        assert!(matches!(
-            parse("\\refresh unexpected"),
-            Some(SpecialCommand::Invalid(_))
-        ));
-        assert_eq!(
-            parse("\\pager banana"),
-            Some(SpecialCommand::Invalid("\\pager expects on or off".into()))
-        );
-        assert_eq!(parse("select 1"), None);
+        assert!(parse("select 1").is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_commands_with_a_reason() {
+        assert_eq!(rejection("\\q unexpected"), "\\q does not accept arguments");
+        assert_eq!(rejection("\\pager banana"), "\\pager expects on or off");
+        assert_eq!(rejection("\\c"), "\\c requires a database name");
+        assert!(rejection("\\nope").starts_with("unknown command: \\nope"));
+        for input in [
+            "\\? unexpected",
+            "\\conninfo unexpected",
+            "\\refresh unexpected",
+        ] {
+            rejection(input);
+        }
     }
 
     #[test]
     fn parses_catalog_commands() {
         assert_eq!(
-            parse("\\d+ public.user*"),
-            Some(SpecialCommand::Catalog(CatalogCommand::Describe {
+            command("\\d+ public.user*"),
+            SpecialCommand::Catalog(CatalogCommand::Describe {
                 pattern: Some("public.user*".into()),
                 verbose: true,
-            }))
+            })
         );
         assert_eq!(
-            parse("\\dt"),
-            Some(SpecialCommand::Catalog(CatalogCommand::ListRelations {
+            command("\\dt"),
+            SpecialCommand::Catalog(CatalogCommand::ListRelations {
                 kind: RelationKind::Table,
                 pattern: None,
                 verbose: false,
-            }))
+            })
         );
         assert_eq!(
-            parse("\\conninfo"),
-            Some(SpecialCommand::Catalog(CatalogCommand::ConnectionInfo))
+            command("\\conninfo"),
+            SpecialCommand::Catalog(CatalogCommand::ConnectionInfo)
         );
     }
 
     #[test]
     fn edit_command_accepts_seed_sql() {
         assert_eq!(
-            parse("\\e select 1;"),
-            Some(SpecialCommand::Edit(Some("select 1;".into())))
+            command("\\e select 1;"),
+            SpecialCommand::Edit(Some("select 1;".into()))
         );
     }
 }
