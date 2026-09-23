@@ -9,6 +9,10 @@ pub enum AppError {
     #[error("stdout closed")]
     StdoutClosed,
 
+    /// The user quit the pager before all output was written.
+    #[error("pager closed")]
+    PagerClosed,
+
     #[error("output writer stopped unexpectedly")]
     OutputSinkClosed,
 

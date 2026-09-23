@@ -372,6 +372,11 @@ impl App {
             Err(error) => {
                 self.transaction =
                     transaction::after_error(self.transaction, sql, 0, standard_conforming_strings);
+                // Quitting the pager cancelled the query; at the REPL that is
+                // the user's choice, not an error to report.
+                if mode == Mode::Repl && matches!(error, AppError::PagerClosed) {
+                    return Ok(());
+                }
                 let recoverable = error.as_recoverable_db_error().is_some();
                 return report_or_fail(mode, error, recoverable);
             }
@@ -401,12 +406,14 @@ impl App {
 
     async fn execute_sql(&self, sql: &str, mode: Mode) -> Result<executor::Execution> {
         let layout = self.layout();
-        // The REPL buffers human output so it can be paged; everything else
-        // streams to stdout as statements complete.
+        // The REPL buffers human output so it can be paged once its size is
+        // known; everything else streams as statements complete, into the pager
+        // when a person is watching a terminal.
         let (output_sink, writer) = if mode == Mode::Repl && !layout.is_machine_readable() {
             (None, None)
         } else {
-            let (sink, writer) = output::stream_writer();
+            let page = self.pager && io::stdout().is_terminal();
+            let (sink, writer) = output::stream_writer(page)?;
             (Some(sink), Some(writer))
         };
         let execution = executor::execute(
@@ -424,10 +431,17 @@ impl App {
         .await;
         // Closing the sink lets the writer thread drain and exit.
         drop(output_sink);
-        if let Some(writer) = writer {
-            writer.await??;
+        let written = match writer {
+            Some(writer) => writer.await?,
+            None => Ok(()),
+        };
+        match (execution, written) {
+            // The query finished before the pager was quit, so its result
+            // stands even though not all of it was read.
+            (Ok(execution), Ok(()) | Err(AppError::PagerClosed)) => Ok(execution),
+            (_, Err(error)) => Err(error),
+            (execution, Ok(())) => execution,
         }
-        execution
     }
 
     fn present_execution(&self, execution: &executor::Execution, elapsed: Duration) -> Result<()> {
