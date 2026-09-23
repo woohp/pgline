@@ -7,170 +7,10 @@ use std::{
 use tabled::{builder::Builder, settings::Style};
 use tokio::sync::mpsc;
 
-pub const MAX_HUMAN_RESULT_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_HUMAN_RESULT_CELLS: usize = 100_000;
-pub const MAX_INTERACTIVE_BATCH_BYTES: usize = 32 * 1024 * 1024;
-
 use crate::{
     cli::OutputFormat,
     error::{AppError, Result},
 };
-
-/// How much result data may be held in memory for human-readable output.
-///
-/// A budget may be shared by several [`ResultSet`]s — `\d pattern` renders one
-/// table per category from a single query and caps their combined size — so the
-/// running totals live here rather than on the result sets themselves. Once a
-/// budget is exhausted it stays exhausted: later rows are counted but dropped,
-/// and every result set that loses a row records that in `retention_limited`.
-#[derive(Debug)]
-pub struct RetentionBudget {
-    retained_bytes: usize,
-    retained_cells: usize,
-    max_bytes: usize,
-    max_cells: usize,
-    exhausted: bool,
-}
-
-impl RetentionBudget {
-    pub fn for_human_result() -> Self {
-        Self::with_limits(MAX_HUMAN_RESULT_BYTES, MAX_HUMAN_RESULT_CELLS)
-    }
-
-    pub fn with_limits(max_bytes: usize, max_cells: usize) -> Self {
-        Self {
-            retained_bytes: 0,
-            retained_cells: 0,
-            max_bytes,
-            max_cells,
-            exhausted: false,
-        }
-    }
-
-    pub fn is_exhausted(&self) -> bool {
-        self.exhausted
-    }
-
-    /// Charges `bytes` and `cells` against the budget, reporting whether they
-    /// fit. Anything that does not fit exhausts the budget permanently.
-    pub fn take(&mut self, bytes: usize, cells: usize) -> bool {
-        if self.exhausted
-            || self.retained_bytes.saturating_add(bytes) > self.max_bytes
-            || self.retained_cells.saturating_add(cells) > self.max_cells
-        {
-            self.exhausted = true;
-            return false;
-        }
-        self.retained_bytes += bytes;
-        self.retained_cells += cells;
-        true
-    }
-}
-
-/// A string that stops growing at a byte limit.
-///
-/// [`finish`](Self::finish) never returns more than `limit` bytes, including the
-/// `marker` it appends when anything was left out — which is why `limit` has to
-/// leave room for the marker in the first place. See [`new`](Self::new).
-///
-/// Once an append is refused the buffer stays limited and later appends are
-/// no-ops, so callers can push a whole sequence of sections and test
-/// [`is_limited`](Self::is_limited) once at the end rather than threading a
-/// "still fits" flag through every step.
-pub struct BoundedBuffer {
-    text: String,
-    limit: usize,
-    marker: &'static str,
-    limited: bool,
-}
-
-impl BoundedBuffer {
-    /// # Panics
-    ///
-    /// Panics unless `marker` fits within `limit`. A buffer too small to report
-    /// its own truncation has no honest behaviour left: it must either exceed the
-    /// limit or drop the marker and claim the output was complete. Both callers
-    /// pass a limit measured in megabytes, so this is a programming error rather
-    /// than a condition to handle.
-    pub fn new(limit: usize, marker: &'static str) -> Self {
-        assert!(
-            marker.len() <= limit,
-            "a {limit}-byte buffer cannot hold its {}-byte truncation marker",
-            marker.len()
-        );
-        Self {
-            text: String::new(),
-            limit,
-            marker,
-            limited: false,
-        }
-    }
-
-    pub fn is_limited(&self) -> bool {
-        self.limited
-    }
-
-    /// Appends `section` whole or not at all, reporting whether it fit. Callers
-    /// rendering independent sections want all-or-nothing so that output never
-    /// ends mid-table.
-    pub fn push(&mut self, section: &str) -> bool {
-        if self.limited {
-            return false;
-        }
-        if self.text.len().saturating_add(section.len()) > self.capacity() {
-            self.limited = true;
-            return false;
-        }
-        self.text.push_str(section);
-        true
-    }
-
-    /// Appends as much of `text` as fits, cutting on a character boundary.
-    ///
-    /// Callers with a single rendered table prefer a partial table to none, so
-    /// this trims rather than refusing. Text that fits within the whole limit is
-    /// kept as-is and leaves the buffer unlimited — with nothing left out there
-    /// is no marker to reserve for, and `finish` reclaims the room if a later
-    /// append changes that.
-    pub fn push_truncated(&mut self, text: &str) {
-        if self.limited {
-            return;
-        }
-        if self.text.len().saturating_add(text.len()) <= self.limit {
-            self.text.push_str(text);
-            return;
-        }
-        let room = self.capacity().saturating_sub(self.text.len());
-        self.text.push_str(&text[..boundary_at_most(text, room)]);
-        self.limited = true;
-    }
-
-    pub fn finish(mut self) -> String {
-        if !self.limited {
-            return self.text;
-        }
-        // push_truncated is allowed to fill the whole limit, so the marker's room
-        // is only guaranteed to be free once a marker is actually needed.
-        self.text
-            .truncate(boundary_at_most(&self.text, self.capacity()));
-        self.text.push_str(self.marker);
-        self.text
-    }
-
-    /// The room available to data, keeping the marker in reserve.
-    fn capacity(&self) -> usize {
-        self.limit.saturating_sub(self.marker.len())
-    }
-}
-
-/// The largest character boundary of `text` at or below `byte_limit`.
-fn boundary_at_most(text: &str, byte_limit: usize) -> usize {
-    let mut boundary = byte_limit.min(text.len());
-    while !text.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    boundary
-}
 
 #[derive(Debug, Default)]
 pub struct ResultSet {
@@ -180,55 +20,29 @@ pub struct ResultSet {
     pub total_rows: usize,
     pub affected_rows: u64,
     pub fields_truncated: bool,
-    pub retention_limited: bool,
 }
 
 impl ResultSet {
-    /// Starts a result set for `columns`, charging the header to `budget`.
-    pub fn with_columns(columns: Vec<String>, budget: &mut RetentionBudget) -> Self {
-        let header_bytes = columns.iter().map(String::len).sum();
-        let header_cells = columns.len();
-        let mut result = Self {
+    pub fn with_columns(columns: Vec<String>) -> Self {
+        Self {
             has_row_description: true,
             columns,
             ..Self::default()
-        };
-        result.retention_limited = !budget.take(header_bytes, header_cells);
-        result
+        }
     }
 
+    /// Counts the row and keeps it unless `row_limit` (0 = unlimited) has been
+    /// reached, truncating each field to `max_field_width` characters.
     pub fn retain_human_row(
         &mut self,
         values: &[Option<&str>],
         row_limit: usize,
         max_field_width: usize,
-        budget: &mut RetentionBudget,
     ) {
         self.total_rows += 1;
-        if row_limit != 0 && self.total_rows > row_limit {
+        if dropped_rows(self.total_rows, row_limit) {
             return;
         }
-        if budget.is_exhausted() {
-            self.retention_limited = true;
-            return;
-        }
-
-        // Empty rows still allocate and vertical output gives each one a
-        // heading, so they must consume the cell budget.
-        let row_cells = values.len().max(1);
-        // A row whose total width overflows `usize` cannot fit any budget, so
-        // treat the overflow itself as exhausting it.
-        let fits = match values.iter().try_fold(0usize, |total, value| {
-            total.checked_add(value.map_or(0, |value| retained_field_len(value, max_field_width)))
-        }) {
-            Some(row_bytes) => budget.take(row_bytes, row_cells),
-            None => budget.take(usize::MAX, row_cells),
-        };
-        if !fits {
-            self.retention_limited = true;
-            return;
-        }
-
         let mut row = Vec::with_capacity(values.len());
         for value in values {
             row.push(value.map(|value| {
@@ -395,9 +209,6 @@ pub fn diagnostic(result: &ResultSet, row_limit: usize) -> String {
     if dropped_rows(result.total_rows, row_limit) {
         diagnostic.push_str(" [rows limited]");
     }
-    if result.retention_limited {
-        diagnostic.push_str(" [output limited]");
-    }
     if result.fields_truncated {
         diagnostic.push_str(" [fields truncated]");
     }
@@ -560,16 +371,6 @@ pub(crate) fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
 
-pub(crate) fn retained_field_len(value: &str, max_width: usize) -> usize {
-    if max_width == 0 {
-        return value.len();
-    }
-    value
-        .char_indices()
-        .nth(max_width)
-        .map_or(value.len(), |(end, _)| end + '…'.len_utf8())
-}
-
 pub(crate) fn truncate_field(value: &str, max_width: usize) -> (String, bool) {
     if max_width == 0 {
         return (value.to_owned(), false);
@@ -688,7 +489,6 @@ mod tests {
             total_rows: 2,
             affected_rows: 2,
             fields_truncated: false,
-            ..ResultSet::default()
         }
     }
 
@@ -754,107 +554,19 @@ mod tests {
     }
 
     #[test]
-    fn human_row_retention_enforces_budgets_without_a_row_limit() {
-        let mut budget = RetentionBudget::with_limits(8, 2);
-        let mut result = ResultSet::with_columns(vec!["value".into()], &mut budget);
-        result.retain_human_row(&[Some("one")], 0, 0, &mut budget);
-        result.retain_human_row(&[Some("two")], 0, 0, &mut budget);
-        result.retain_human_row(&[Some("three")], 0, 0, &mut budget);
+    fn retained_rows_respect_the_row_limit_and_field_width() {
+        let mut result = ResultSet::with_columns(vec!["value".into()]);
+        result.retain_human_row(&[Some("abcdef")], 2, 3);
+        result.retain_human_row(&[None], 2, 3);
+        result.retain_human_row(&[Some("dropped")], 2, 3);
 
         assert_eq!(result.total_rows, 3);
-        assert_eq!(result.rows, [vec![Some("one".into())]]);
-        assert!(result.retention_limited);
-        assert!(render_table_output(&result, 0).contains("[output limited]"));
-    }
-
-    #[test]
-    fn refused_sections_are_dropped_whole_and_stay_refused() {
-        let mut buffer = BoundedBuffer::new(4, "");
-        assert!(!buffer.push("oversized"));
-        assert!(!buffer.push("ok"), "the buffer stays limited once refused");
-
-        assert!(buffer.is_limited());
-        assert!(buffer.finish().is_empty(), "no partial section was written");
-    }
-
-    #[test]
-    fn a_refused_push_reserves_room_for_the_marker() {
-        let marker = "[cut]";
-        let mut buffer = BoundedBuffer::new(marker.len() + 5, marker);
-        assert!(buffer.push("12345"));
-        assert!(!buffer.push("6"));
-
-        assert_eq!(buffer.finish(), format!("12345{marker}"));
-    }
-
-    #[test]
-    #[should_panic(expected = "cannot hold its")]
-    fn a_limit_too_small_for_the_marker_is_rejected() {
-        BoundedBuffer::new("[cut]".len() - 1, "[cut]");
-    }
-
-    #[test]
-    fn a_limit_exactly_the_marker_size_is_allowed() {
-        // The tightest legal buffer: no room for data, so finish is all marker.
-        let mut buffer = BoundedBuffer::new("[cut]".len(), "[cut]");
-        assert!(!buffer.push("x"));
-
-        assert_eq!(buffer.finish(), "[cut]");
-    }
-
-    #[test]
-    fn a_later_refusal_still_leaves_room_for_the_marker() {
-        // push_truncated may fill the limit exactly, since text that fits needs
-        // no marker. A refused push afterwards does need one.
-        let mut buffer = BoundedBuffer::new(5, "[cut]");
-        buffer.push_truncated("12345");
-        assert!(!buffer.push("x"));
-
-        assert_eq!(buffer.finish(), "[cut]");
-    }
-
-    #[test]
-    fn truncating_pushes_keep_text_that_fits_whole() {
-        let mut buffer = BoundedBuffer::new(5, "[cut]");
-        buffer.push_truncated("12345");
-
+        assert_eq!(result.rows, [vec![Some("abc…".into())], vec![None]]);
+        assert!(result.fields_truncated);
         assert!(
-            !buffer.is_limited(),
-            "text within the limit is not a truncation"
+            render_table_output(&result, 2)
+                .ends_with("(3 rows) [rows limited] [fields truncated]\n")
         );
-        assert_eq!(buffer.finish(), "12345");
-    }
-
-    #[test]
-    fn truncating_pushes_cut_on_character_boundaries() {
-        // "ααα" is six bytes and the limit is four, leaving three bytes for data
-        // once the one-byte marker is reserved — mid-way through a character.
-        let mut buffer = BoundedBuffer::new(4, "!");
-        buffer.push_truncated("ααα");
-
-        assert!(buffer.is_limited());
-        assert_eq!(buffer.finish(), "α!");
-    }
-
-    #[test]
-    fn several_result_sets_can_share_one_retention_budget() {
-        let mut budget = RetentionBudget::with_limits(10, 10);
-        let mut columns = ResultSet::with_columns(Vec::new(), &mut budget);
-        let mut constraints = ResultSet::with_columns(Vec::new(), &mut budget);
-        let mut indexes = ResultSet::with_columns(Vec::new(), &mut budget);
-
-        columns.retain_human_row(&[Some("1234567")], 0, 0, &mut budget);
-        constraints.retain_human_row(&[Some("abc")], 0, 0, &mut budget);
-        indexes.retain_human_row(&[Some("x")], 0, 0, &mut budget);
-
-        assert_eq!(columns.rows.len(), 1);
-        assert_eq!(constraints.rows.len(), 1);
-        assert!(
-            indexes.rows.is_empty(),
-            "the shared budget was already full"
-        );
-        assert!(indexes.retention_limited);
-        assert!(budget.is_exhausted());
     }
 
     #[test]
@@ -939,7 +651,6 @@ mod tests {
             total_rows: 1,
             affected_rows: 1,
             fields_truncated: false,
-            ..ResultSet::default()
         };
         let table = render_table_output(&result, 0);
         assert!(!table.contains('\x1b'));
