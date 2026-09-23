@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use reedline::{Completer, Span, Suggestion};
+use reedline::{Completer, CompletionResult, Span, Suggestion};
 
 use crate::{
     metadata::{Metadata, MetadataStore},
@@ -342,7 +342,13 @@ fn is_describe_argument_completion(line: &str) -> bool {
 }
 
 impl Completer for SqlCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
+        CompletionResult::fresh(self.suggestions(line, pos))
+    }
+}
+
+impl SqlCompleter {
+    fn suggestions(&self, line: &str, pos: usize) -> Vec<Suggestion> {
         let standard_conforming_strings = self.standard_conforming_strings.load(Ordering::Relaxed);
         let typed = &line[..pos];
         let completing_command_name =
@@ -393,7 +399,7 @@ mod tests {
     #[test]
     fn suggests_unqualified_relations_after_from_without_qualified_duplicates() {
         let values: Vec<_> = completer()
-            .complete("select * from us", 16)
+            .suggestions("select * from us", 16)
             .into_iter()
             .map(|s| s.value)
             .collect();
@@ -408,33 +414,33 @@ mod tests {
             relations: vec!["users".into()],
             ..Metadata::default()
         });
-        let mut completer = SqlCompleter::new(metadata, Arc::clone(&setting));
+        let completer = SqlCompleter::new(metadata, Arc::clone(&setting));
         let line = "SELECT 'it\\'s' FROM us";
 
-        assert!(completer.complete(line, line.len()).is_empty());
+        assert!(completer.suggestions(line, line.len()).is_empty());
         setting.store(false, Ordering::Relaxed);
-        assert_eq!(completer.complete(line, line.len())[0].value, "users");
+        assert_eq!(completer.suggestions(line, line.len())[0].value, "users");
     }
 
     #[test]
     fn observes_metadata_replacements() {
         let metadata = MetadataStore::default();
-        let mut completer = SqlCompleter::new(metadata.clone(), Arc::new(AtomicBool::new(true)));
+        let completer = SqlCompleter::new(metadata.clone(), Arc::new(AtomicBool::new(true)));
         let line = "select * from us";
-        assert!(completer.complete(line, line.len()).is_empty());
+        assert!(completer.suggestions(line, line.len()).is_empty());
 
         metadata.replace(Metadata {
             relations: vec!["users".into()],
             ..Metadata::default()
         });
 
-        assert_eq!(completer.complete(line, line.len())[0].value, "users");
+        assert_eq!(completer.suggestions(line, line.len())[0].value, "users");
     }
 
     #[test]
     fn suggests_relations_after_schema_qualification() {
         let values: Vec<_> = completer()
-            .complete("select * from public.us", 23)
+            .suggestions("select * from public.us", 23)
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
@@ -446,7 +452,7 @@ mod tests {
         };
         let line = "select * from \"odd.schema\".Ord";
         let values: Vec<_> = SqlCompleter::for_metadata(metadata)
-            .complete(line, line.len())
+            .suggestions(line, line.len())
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
@@ -456,7 +462,7 @@ mod tests {
     #[test]
     fn suggests_qualified_columns() {
         let values: Vec<_> = completer()
-            .complete("select users.n", 14)
+            .suggestions("select users.n", 14)
             .into_iter()
             .map(|s| s.value)
             .collect();
@@ -467,7 +473,7 @@ mod tests {
     fn equivalent_quoted_qualifiers_suggest_columns() {
         let line = "select \"users\".";
         let values: Vec<_> = completer()
-            .complete(line, line.len())
+            .suggestions(line, line.len())
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
@@ -485,7 +491,7 @@ mod tests {
             "\"odd.schema\".\"Order.Items\"".into(),
         ]);
         let values: Vec<_> = SqlCompleter::for_metadata(metadata.clone())
-            .complete("select * from ", 14)
+            .suggestions("select * from ", 14)
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
@@ -495,7 +501,7 @@ mod tests {
         assert!(values.contains(&"\"odd.schema\".\"Order.Items\"".into()));
 
         let partial: Vec<_> = SqlCompleter::for_metadata(metadata)
-            .complete("select * from Ord", 17)
+            .suggestions("select * from Ord", 17)
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
@@ -506,7 +512,7 @@ mod tests {
             relations: vec!["\"a\"\"b\"".into()],
             ..Metadata::default()
         })
-        .complete(line, line.len())
+        .suggestions(line, line.len())
         .into_iter()
         .find(|suggestion| suggestion.value == "\"a\"\"b\"")
         .unwrap();
@@ -524,7 +530,7 @@ mod tests {
         };
         let line = "select \"odd.schema\".\"Order.Items\".";
         let values: Vec<_> = SqlCompleter::for_metadata(metadata)
-            .complete(line, line.len())
+            .suggestions(line, line.len())
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
@@ -542,7 +548,7 @@ mod tests {
                 relations: vec![raw.into()],
                 ..Metadata::default()
             })
-            .complete("select * from ", 14);
+            .suggestions("select * from ", 14);
             assert!(!suggestions.iter().any(|suggestion| suggestion.value == raw));
         }
     }
@@ -550,14 +556,14 @@ mod tests {
     #[test]
     fn suggests_relations_for_describe_arguments() {
         let values: Vec<_> = completer()
-            .complete("\\d us", 5)
+            .suggestions("\\d us", 5)
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
         assert_eq!(values, ["users"]);
 
         let values: Vec<_> = completer()
-            .complete("\\d+ us", 6)
+            .suggestions("\\d+ us", 6)
             .into_iter()
             .map(|suggestion| suggestion.value)
             .collect();
@@ -568,7 +574,7 @@ mod tests {
     fn suggests_special_commands() {
         assert!(
             completer()
-                .complete("\\e", 2)
+                .suggestions("\\e", 2)
                 .iter()
                 .any(|s| s.value == "\\e")
         );
