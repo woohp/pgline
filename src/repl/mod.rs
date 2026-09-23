@@ -32,15 +32,7 @@ pub fn create_editor(
     metadata: MetadataStore,
     standard_conforming_strings: Arc<AtomicBool>,
 ) -> Result<Reedline> {
-    let history_path = cli
-        .history_file
-        .clone()
-        .unwrap_or_else(default_history_path);
-    if let Some(parent) = history_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let history_path = prepare_history_file(&history_path, cli.history_file.is_some())?;
-    let history = Box::new(FileBackedHistory::with_file(10_000, history_path)?);
+    let history = history(cli);
     let menu = ColumnarMenu::default()
         .with_name("completion_menu")
         .with_columns(4);
@@ -195,55 +187,68 @@ impl Prompt for SqlPrompt {
     }
 }
 
+const HISTORY_CAPACITY: usize = 10_000;
+
+/// History is a convenience, so a history file that cannot be used safely
+/// costs this session its saved history rather than refusing to start.
+fn history(cli: &Cli) -> Box<dyn History> {
+    let path = cli
+        .history_file
+        .clone()
+        .unwrap_or_else(default_history_path);
+    let file_history = prepare_history_file(&path, cli.history_file.is_some())
+        .map_err(|error| error.to_string())
+        .and_then(|path| {
+            FileBackedHistory::with_file(HISTORY_CAPACITY, path).map_err(|error| error.to_string())
+        });
+    match file_history {
+        Ok(history) => Box::new(history),
+        Err(error) => {
+            eprintln!(
+                "warning: history file {} is unavailable ({}); this session's history will not be saved",
+                output::safe_terminal_text(&path.display().to_string()),
+                output::safe_terminal_text(&error)
+            );
+            Box::new(
+                FileBackedHistory::new(HISTORY_CAPACITY)
+                    .expect("in-memory history has no file to fail on"),
+            )
+        }
+    }
+}
+
+/// Creates the history file if needed and checks that it is private to the
+/// current user. Symbolic links are refused because the file is reopened by
+/// path on every save.
 fn prepare_history_file(path: &Path, user_supplied: bool) -> std::io::Result<PathBuf> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
     #[cfg(unix)]
     {
         use std::io::ErrorKind;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(std::io::Error::new(
-                    ErrorKind::InvalidInput,
-                    "history path must not be a symbolic link",
-                ));
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty());
-        let parent = parent.unwrap_or_else(|| Path::new("."));
-        let parent = std::fs::canonicalize(parent)?;
-        // Reedline later reopens the path itself, so O_NOFOLLOW on this open is
-        // not sufficient unless other users also cannot replace the entry.
-        validate_history_parent_chain(&parent)?;
-        let file_name = path.file_name().ok_or_else(|| {
-            std::io::Error::new(ErrorKind::InvalidInput, "history path has no file name")
-        })?;
-        // Pass Reedline the canonical parent path so a symlinked parent cannot
-        // be redirected after validation.
-        let path = parent.join(file_name);
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)?;
+            .open(path)?;
         let metadata = file.metadata()?;
         if !metadata.file_type().is_file() {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidInput,
-                "history path must be a regular file",
+                "not a regular file",
             ));
         }
         if metadata.uid() != unsafe { libc::geteuid() } {
             return Err(std::io::Error::new(
                 ErrorKind::PermissionDenied,
-                "history file must be owned by the current user",
+                "not owned by the current user",
             ));
         }
         if metadata.permissions().mode() & 0o077 != 0 {
@@ -256,57 +261,13 @@ fn prepare_history_file(path: &Path, user_supplied: bool) -> std::io::Result<Pat
                 file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
             }
         }
-        Ok(path)
     }
     #[cfg(not(unix))]
     {
         OpenOptions::new().create(true).append(true).open(path)?;
         let _ = user_supplied;
-        Ok(path.to_owned())
     }
-}
-
-#[cfg(unix)]
-fn validate_history_parent_chain(parent: &Path) -> std::io::Result<()> {
-    use std::io::ErrorKind;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-    const STICKY_BIT: u32 = 0o1000;
-    let effective_uid = unsafe { libc::geteuid() };
-    let mut child = parent.to_owned();
-    let child_metadata = std::fs::metadata(&child)?;
-    if !child_metadata.is_dir() {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "history parent must be a directory",
-        ));
-    }
-    let child_mode = child_metadata.permissions().mode();
-    if child_mode & 0o022 != 0 && child_mode & STICKY_BIT == 0 {
-        return Err(std::io::Error::new(
-            ErrorKind::PermissionDenied,
-            "history parent must not permit replacement by another user unless it is sticky",
-        ));
-    }
-
-    while let Some(ancestor) = child.parent() {
-        if ancestor == child {
-            break;
-        }
-        let ancestor_metadata = std::fs::metadata(ancestor)?;
-        let mode = ancestor_metadata.permissions().mode();
-        if mode & 0o022 != 0 {
-            let child_metadata = std::fs::metadata(&child)?;
-            if mode & STICKY_BIT == 0 || child_metadata.uid() != effective_uid {
-                return Err(std::io::Error::new(
-                    ErrorKind::PermissionDenied,
-                    "history directory chain permits replacement by another user",
-                ));
-            }
-        }
-        child = ancestor.to_owned();
-    }
-    Ok(())
+    Ok(path.to_owned())
 }
 
 fn default_history_path() -> PathBuf {
@@ -322,6 +283,7 @@ fn default_history_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     #[test]
     fn history_hints_sanitize_content_before_applying_trusted_style() {
@@ -356,7 +318,7 @@ mod tests {
     fn creates_private_default_history() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("history");
+        let path = directory.path().join("pgline").join("history");
         prepare_history_file(&path, false).unwrap();
         assert_eq!(
             std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
@@ -364,38 +326,24 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn rejects_replaceable_history_parents() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn unusable_history_paths_fall_back_to_in_memory_history() {
         let directory = tempfile::tempdir().unwrap();
-        let parent = directory.path().join("shared");
-        std::fs::create_dir(&parent).unwrap();
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let blocker = directory.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let cli = Cli::try_parse_from([
+            "pgline",
+            "--history-file",
+            blocker.join("history").to_str().unwrap(),
+        ])
+        .unwrap();
 
-        let error = prepare_history_file(&parent.join("history"), false).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let mut history = history(&cli);
 
-        let nested = parent.join("private");
-        std::fs::create_dir(&nested).unwrap();
-        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let error = prepare_history_file(&nested.join("history"), false).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn accepts_owned_history_in_a_sticky_parent() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let directory = tempfile::tempdir().unwrap();
-        let parent = directory.path().join("sticky");
-        std::fs::create_dir(&parent).unwrap();
-        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o1777)).unwrap();
-
-        let path = prepare_history_file(&parent.join("history"), false).unwrap();
-        assert!(path.is_file());
+        history
+            .save(reedline::HistoryItem::from_command_line("select 1"))
+            .expect("in-memory history accepts entries");
+        assert!(!blocker.join("history").exists());
     }
 
     #[cfg(unix)]
@@ -409,8 +357,7 @@ mod tests {
         let path = directory.path().join("history");
         symlink(&target, &path).unwrap();
 
-        let error = prepare_history_file(&path, false).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        prepare_history_file(&path, false).unwrap_err();
         assert_eq!(std::fs::read_to_string(target).unwrap(), "unchanged");
     }
 
