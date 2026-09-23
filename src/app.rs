@@ -44,7 +44,10 @@ pub enum Mode {
     OneShot,
 }
 
-const DEFAULT_MAX_FIELD_WIDTH: usize = 500;
+/// Limits applied at the REPL unless overridden, so an accidental `SELECT *`
+/// at the prompt stays survivable. Scripts get complete output.
+const REPL_ROW_LIMIT: usize = 1000;
+const REPL_MAX_FIELD_WIDTH: usize = 500;
 const METADATA_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const CATALOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -78,7 +81,9 @@ impl App {
         if let Some(sql) = self.cli.execute.clone() {
             if let Some(command) = commands::parse(&sql) {
                 // One-shot runs exit after the command either way.
-                if let CommandOutcome::ReplaceBuffer(query) = self.handle_command(command?).await? {
+                if let CommandOutcome::ReplaceBuffer(query) =
+                    self.handle_command(command?, Mode::OneShot).await?
+                {
                     output::write_stdout(&query)?;
                 }
                 return Ok(());
@@ -141,7 +146,7 @@ impl App {
                     };
                     let is_catalog = matches!(&command, Ok(SpecialCommand::Catalog(_)));
                     let outcome = match command {
-                        Ok(command) => self.handle_command(command).await,
+                        Ok(command) => self.handle_command(command, Mode::Repl).await,
                         Err(error) => Err(error),
                     };
                     match outcome {
@@ -179,7 +184,11 @@ impl App {
         Ok(())
     }
 
-    async fn handle_command(&mut self, command: SpecialCommand) -> Result<CommandOutcome> {
+    async fn handle_command(
+        &mut self,
+        command: SpecialCommand,
+        mode: Mode,
+    ) -> Result<CommandOutcome> {
         match command {
             SpecialCommand::Help => output::write_stdout(commands::HELP)?,
             SpecialCommand::Quit => {
@@ -212,18 +221,22 @@ impl App {
             }
             SpecialCommand::Refresh => self.refresh_metadata().await?,
             SpecialCommand::Connect(database) => return self.reconnect(&database).await,
-            SpecialCommand::Catalog(command) => self.run_catalog_command(&command).await?,
+            SpecialCommand::Catalog(command) => self.run_catalog_command(&command, mode).await?,
         }
         Ok(CommandOutcome::Continue)
     }
 
-    async fn run_catalog_command(&mut self, command: &CatalogCommand) -> Result<()> {
+    async fn run_catalog_command(&mut self, command: &CatalogCommand, mode: Mode) -> Result<()> {
         let catalog = commands::catalog::run(
             &self.database.client,
             command,
             commands::catalog::CatalogLimits {
-                row_limit: self.cli.row_limit,
-                max_field_width: self.cli.max_field_width.unwrap_or(DEFAULT_MAX_FIELD_WIDTH),
+                row_limit: effective_row_limit(mode, self.cli.row_limit),
+                max_field_width: effective_max_field_width(
+                    mode,
+                    Layout::Table,
+                    self.cli.max_field_width,
+                ),
             },
         );
         let outcome = executor::await_cancellable_query(
@@ -403,8 +416,8 @@ impl App {
             executor::ExecutionOptions {
                 format: self.cli.format,
                 expanded: self.expanded,
-                row_limit: self.cli.row_limit,
-                max_field_width: effective_max_field_width(layout, self.cli.max_field_width),
+                row_limit: effective_row_limit(mode, self.cli.row_limit),
+                max_field_width: effective_max_field_width(mode, layout, self.cli.max_field_width),
             },
             output_sink.as_ref(),
         )
@@ -487,13 +500,20 @@ fn warn_if_metadata_truncated(metadata: &Metadata) {
     }
 }
 
-/// Machine-readable output keeps whole fields unless a width was asked for;
-/// human output truncates long fields by default.
-fn effective_max_field_width(layout: Layout, configured: Option<usize>) -> usize {
-    configured.unwrap_or(if layout.is_machine_readable() {
-        0
+fn effective_row_limit(mode: Mode, configured: Option<usize>) -> usize {
+    configured.unwrap_or(match mode {
+        Mode::Repl => REPL_ROW_LIMIT,
+        Mode::OneShot => 0,
+    })
+}
+
+/// Only human output at the REPL truncates fields by default. Scripts and
+/// machine-readable output keep whole fields unless a width was asked for.
+fn effective_max_field_width(mode: Mode, layout: Layout, configured: Option<usize>) -> usize {
+    configured.unwrap_or(if mode == Mode::Repl && !layout.is_machine_readable() {
+        REPL_MAX_FIELD_WIDTH
     } else {
-        DEFAULT_MAX_FIELD_WIDTH
+        0
     })
 }
 
@@ -596,7 +616,9 @@ mod tests {
         let mut app = App::new(cli, database);
 
         assert_eq!(
-            app.handle_command(SpecialCommand::Refresh).await.unwrap(),
+            app.handle_command(SpecialCommand::Refresh, Mode::Repl)
+                .await
+                .unwrap(),
             CommandOutcome::Continue
         );
 
@@ -822,15 +844,27 @@ mod tests {
     }
 
     #[test]
-    fn machine_output_defaults_follow_expanded_mode() {
+    fn default_limits_apply_only_to_human_output_at_the_repl() {
         let csv = Layout::new(OutputFormat::Csv, false);
         let expanded_csv = Layout::new(OutputFormat::Csv, true);
         let table = Layout::new(OutputFormat::Table, false);
-        assert_eq!(effective_max_field_width(csv, None), 0);
-        assert_eq!(effective_max_field_width(expanded_csv, None), 500);
-        assert_eq!(effective_max_field_width(table, None), 500);
-        assert_eq!(effective_max_field_width(csv, Some(12)), 12);
-        assert_eq!(effective_max_field_width(expanded_csv, Some(12)), 12);
+
+        assert_eq!(effective_row_limit(Mode::Repl, None), 1000);
+        assert_eq!(effective_row_limit(Mode::OneShot, None), 0);
+        assert_eq!(effective_row_limit(Mode::OneShot, Some(7)), 7);
+
+        assert_eq!(effective_max_field_width(Mode::Repl, csv, None), 0);
+        assert_eq!(
+            effective_max_field_width(Mode::Repl, expanded_csv, None),
+            500
+        );
+        assert_eq!(effective_max_field_width(Mode::Repl, table, None), 500);
+        assert_eq!(effective_max_field_width(Mode::OneShot, table, None), 0);
+        assert_eq!(effective_max_field_width(Mode::Repl, csv, Some(12)), 12);
+        assert_eq!(
+            effective_max_field_width(Mode::OneShot, table, Some(12)),
+            12
+        );
     }
 
     #[test]
