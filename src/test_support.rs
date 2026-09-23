@@ -47,14 +47,16 @@ pub(crate) async fn backend_pid(client: &Client) -> i32 {
         .get(0)
 }
 
-/// Polls `observer` until backend `pid` is actively running a query whose text
-/// contains `marker`.
+/// Polls `observer` until backend `pid` is inside a `pg_sleep` in a query whose
+/// text contains `marker`. Waiting for the sleep itself, rather than for the
+/// query to be active, means every statement before it in a batch has run.
 pub(crate) async fn wait_until_query_active(observer: &Client, pid: i32, marker: &str) {
     loop {
         let active: bool = observer
             .query_one(
                 "SELECT EXISTS(SELECT 1 FROM pg_stat_activity \
-                 WHERE pid = $1 AND state = 'active' AND position($2 in query) > 0)",
+                 WHERE pid = $1 AND state = 'active' AND wait_event = 'PgSleep' \
+                   AND position($2 in query) > 0)",
                 &[&pid, &marker],
             )
             .await

@@ -402,7 +402,7 @@ where
     }
 }
 
-fn is_query_cancelled(error: &tokio_postgres::Error) -> bool {
+pub(crate) fn is_query_cancelled(error: &tokio_postgres::Error) -> bool {
     error
         .as_db_error()
         .is_some_and(|error| *error.code() == tokio_postgres::error::SqlState::QUERY_CANCELED)

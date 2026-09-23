@@ -401,10 +401,20 @@ impl App {
         };
         // An output failure says nothing about whether the query ran, so the
         // transaction state above stands. Quitting the pager cancelled whatever
-        // was still running, and at the REPL that is not an error to report.
+        // was still running, and at the REPL that is not an error to report;
+        // any other error the batch hit is.
         match written {
             Ok(()) => {}
-            Err(AppError::PagerClosed) if mode == Mode::Repl => return Ok(()),
+            Err(AppError::PagerClosed)
+                if mode == Mode::Repl
+                    && execution
+                        .error
+                        .as_ref()
+                        .is_none_or(executor::is_query_cancelled) =>
+            {
+                return Ok(());
+            }
+            Err(AppError::PagerClosed) if mode == Mode::Repl => {}
             Err(error) => return Err(error),
         }
         self.present_execution(&execution, query_started.elapsed())?;
