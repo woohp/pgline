@@ -53,6 +53,17 @@ pgline my_database -c 'select 1'
 pgline my_database -f query.sql
 ```
 
+Output to a terminal that is longer than the screen goes through
+`$PGLINE_PAGER`, then `$PAGER`, then `less`; shorter output is printed as is.
+Output to a pipe or file is never paged. CSV and TSV rows stream into the pager
+as they arrive; table and vertical output is written once each statement
+completes. Quitting the pager cancels the query. A CSV-aware pager works well
+with `--format csv`:
+
+```sh
+PGLINE_PAGER=csvlens pgline my_database --format csv -c 'select * from events'
+```
+
 ## Commands
 
 ```text

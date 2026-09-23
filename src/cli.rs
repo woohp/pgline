@@ -56,11 +56,11 @@ pub struct Cli {
     #[arg(long, value_enum, default_value_t)]
     pub format: OutputFormat,
 
-    /// Maximum rows retained for display per result set; 0 means unlimited
-    #[arg(long, default_value_t = 1000)]
-    pub row_limit: usize,
+    /// Maximum rows shown per result set; 0 means unlimited. Defaults to 1000 at the REPL and unlimited for -c, -f and piped input
+    #[arg(long)]
+    pub row_limit: Option<usize>,
 
-    /// Maximum characters retained per field; defaults to 500 for human output and unlimited for CSV/TSV
+    /// Maximum characters shown per field; 0 means unlimited. Defaults to 500 for table and vertical output at the REPL and unlimited otherwise
     #[arg(long)]
     pub max_field_width: Option<usize>,
 
@@ -105,10 +105,13 @@ mod tests {
     }
 
     #[test]
-    fn field_width_is_opt_in_at_the_cli_layer() {
+    fn limits_are_opt_in_at_the_cli_layer() {
         let defaults = Cli::try_parse_from(["pgline"]).unwrap();
+        assert_eq!(defaults.row_limit, None);
         assert_eq!(defaults.max_field_width, None);
-        let explicit = Cli::try_parse_from(["pgline", "--max-field-width", "42"]).unwrap();
+        let explicit =
+            Cli::try_parse_from(["pgline", "--row-limit", "7", "--max-field-width", "42"]).unwrap();
+        assert_eq!(explicit.row_limit, Some(7));
         assert_eq!(explicit.max_field_width, Some(42));
     }
 

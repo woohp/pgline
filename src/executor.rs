@@ -42,9 +42,9 @@ pub async fn execute(
     loop {
         let message = tokio::select! {
             message = stream.next() => message,
-            () = output_sink_closed(output_sink), if output_sink.is_some() => {
+            () = output_sink_closed(output_sink), if output_sink.is_some() && !state.output_closed => {
                 state.handle_closed_output_sink().await?;
-                return Err(AppError::OutputSinkClosed);
+                continue;
             }
             interrupt = tokio::signal::ctrl_c() => {
                 interrupt?;
@@ -97,6 +97,10 @@ struct ExecutionState<'a> {
     completed_statements: usize,
     query_error: Option<tokio_postgres::Error>,
     cancelled: bool,
+    /// The reader of `output_sink` has gone away. The query has been cancelled
+    /// and any further output is dropped, but the stream is still drained so
+    /// `completed_statements` stays accurate.
+    output_closed: bool,
     layout: output::Layout,
     /// Set when rows are streamed out as delimited text as they arrive. Every
     /// other layout needs the whole result set before it can render anything,
@@ -126,6 +130,7 @@ impl<'a> ExecutionState<'a> {
             completed_statements: 0,
             query_error: None,
             cancelled: false,
+            output_closed: false,
             layout,
             streamed_delimiter,
             stdout_is_terminal: std::io::stdout().is_terminal(),
@@ -242,17 +247,26 @@ impl<'a> ExecutionState<'a> {
     }
 
     async fn send(&mut self, message: output::StreamOutput) -> Result<()> {
-        send_output(
+        if self.output_closed {
+            return Ok(());
+        }
+        let sent = send_output(
             self.output_sink.expect("stream output has an output sink"),
             message,
             self.canceller,
             &mut self.cancelled,
         )
-        .await
+        .await?;
+        if !sent {
+            self.output_closed = true;
+        }
+        Ok(())
     }
 
     async fn handle_closed_output_sink(&mut self) -> Result<()> {
+        self.output_closed = true;
         if !self.cancelled {
+            self.cancelled = true;
             self.canceller.cancel().await?;
         }
         Ok(())
@@ -278,12 +292,14 @@ impl<'a> ExecutionState<'a> {
     }
 }
 
+/// Sends `output`, returning `false` when the reader has gone away, in which
+/// case the query is cancelled. Ctrl-C while waiting for room also cancels it.
 async fn send_output(
     sender: &mpsc::Sender<output::StreamOutput>,
     output: output::StreamOutput,
     canceller: &Canceller,
     cancelled: &mut bool,
-) -> Result<()> {
+) -> Result<bool> {
     loop {
         tokio::select! {
             permit = sender.reserve() => {
@@ -291,16 +307,17 @@ async fn send_output(
                     Ok(permit) => permit,
                     Err(_) => {
                         if !*cancelled {
+                            *cancelled = true;
                             canceller.cancel().await?;
                         }
-                        return Err(AppError::OutputSinkClosed);
+                        return Ok(false);
                     }
                 };
                 permit.send(output);
                 // Give the writer a chance to drain the bounded channel before
                 // polling more server messages from a large statement batch.
                 tokio::task::yield_now().await;
-                return Ok(());
+                return Ok(true);
             }
             interrupt = tokio::signal::ctrl_c() => {
                 interrupt?;
@@ -385,7 +402,7 @@ where
     }
 }
 
-fn is_query_cancelled(error: &tokio_postgres::Error) -> bool {
+pub(crate) fn is_query_cancelled(error: &tokio_postgres::Error) -> bool {
     error
         .as_db_error()
         .is_some_and(|error| *error.code() == tokio_postgres::error::SqlState::QUERY_CANCELED)
@@ -648,6 +665,38 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "requires PGLINE_TEST_URL"]
+    async fn closed_sink_keeps_the_completed_statement_count() {
+        let database = connect().await;
+        let observer = connect().await;
+        let pid = backend_pid(&database.client).await;
+        let (sender, receiver) = mpsc::channel(8);
+        let canceller = database.canceller();
+        let execution = execute(
+            &database.client,
+            &canceller,
+            "SELECT 1; BEGIN; SELECT pg_sleep(30) /* pgline_progress_test */",
+            options(OutputFormat::Csv, 0),
+            Some(&sender),
+        );
+        let close_sink = async {
+            wait_until_query_active(&observer.client, pid, "pgline_progress_test").await;
+            drop(receiver);
+        };
+        let (execution, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(execution, close_sink)
+        })
+        .await
+        .expect("cancelled query did not finish");
+        let execution = execution.unwrap();
+        // The transaction tracker relies on knowing that BEGIN ran.
+        assert_eq!(execution.completed_statements, 2);
+        assert!(execution.error.as_ref().is_some_and(is_query_cancelled));
+        database.client.batch_execute("ROLLBACK").await.unwrap();
+        assert_connection_usable(&database.client).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "requires PGLINE_TEST_URL"]
     async fn sink_closure_cancels_queries_and_preserves_connection_reuse() {
         let database = connect().await;
         let observer = connect().await;
@@ -667,11 +716,9 @@ mod tests {
                 drop(receiver);
             };
             let (execution, ()) = tokio::join!(execution, close_active_sink);
-            let error = match execution {
-                Ok(_) => panic!("query succeeded after the output receiver closed"),
-                Err(error) => error,
-            };
-            assert!(matches!(error, AppError::OutputSinkClosed));
+            let execution = execution.unwrap();
+            assert!(execution.error.as_ref().is_some_and(is_query_cancelled));
+            assert_eq!(execution.completed_statements, 0);
             assert_connection_usable(&database.client).await;
         })
         .await
@@ -701,7 +748,7 @@ mod tests {
             let (sleeping, blocked_send, ()) =
                 tokio::join!(sleeping, blocked_send, close_full_sink);
             assert!(sleeping.is_err(), "sleeping query was not cancelled");
-            assert!(matches!(blocked_send, Err(AppError::OutputSinkClosed)));
+            assert!(!blocked_send.unwrap(), "the closed sink was not reported");
             assert_connection_usable(&database.client).await;
         })
         .await

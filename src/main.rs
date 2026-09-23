@@ -22,7 +22,12 @@ use crate::{app::App, cli::Cli, error::Result};
 #[tokio::main]
 async fn main() {
     if let Err(error) = run().await {
-        if matches!(error, crate::error::AppError::StdoutClosed) {
+        // The reader went away, as with `| head` or quitting the pager; there
+        // is nobody left to report to.
+        if matches!(
+            error,
+            crate::error::AppError::StdoutClosed | crate::error::AppError::PagerClosed
+        ) {
             return;
         }
         let _ = writeln!(

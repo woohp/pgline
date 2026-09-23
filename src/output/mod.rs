@@ -1,7 +1,7 @@
 use std::{
     env,
     io::{self, IsTerminal, Write},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
 };
 
 use tabled::{builder::Builder, settings::Style};
@@ -65,36 +65,148 @@ pub enum StreamOutput {
     Diagnostic(String),
 }
 
-/// Starts a blocking writer thread that copies streamed output to stdout and
-/// stderr. Dropping the sender ends the thread; await the handle to collect
-/// any write error.
-pub fn stream_writer() -> (
+/// Starts a blocking writer thread that copies streamed data to stdout, or
+/// into the pager when `page` is set, and diagnostics to stderr. Dropping the
+/// sender ends the thread; await the handle to collect any write error.
+pub fn stream_writer(
+    page: bool,
+) -> (
     mpsc::Sender<StreamOutput>,
     tokio::task::JoinHandle<Result<()>>,
 ) {
     let (sender, receiver) = mpsc::channel(8);
     let task = tokio::task::spawn_blocking(move || {
-        write_stream(
-            receiver,
-            |data| {
-                let stdout = io::stdout();
-                let mut stdout = stdout.lock();
-                write_stdout_to(&mut stdout, data.as_bytes())?;
-                stdout.flush().map_err(stdout_error)
-            },
-            |diagnostic| {
-                // PostgreSQL notices are logged to stderr by the connection
-                // task, so never retain this lock while waiting for events.
-                let stderr = io::stderr();
-                let mut stderr = stderr.lock();
-                stderr.write_all(diagnostic.as_bytes())?;
-                stderr.write_all(b"\n")?;
-                stderr.flush()?;
-                Ok(())
-            },
-        )
+        if page {
+            write_stream_to_pager(
+                receiver,
+                &pager_command(),
+                screen_lines(),
+                write_stdout,
+                write_diagnostic,
+            )
+        } else {
+            write_stream(receiver, write_stdout, write_diagnostic)
+        }
     });
     (sender, task)
+}
+
+/// Streams into a pager, which is started only once the output reaches
+/// `page_after_lines`. Shorter output, such as a row count or a few rows, is
+/// written through `write_data` and `write_diagnostic` in its original order
+/// at the end instead, so a pager never opens on something that fits on the
+/// screen. Quitting the pager early closes the pipe and surfaces as
+/// [`AppError::PagerClosed`].
+///
+/// Once a pager is running, diagnostics are held until it exits: a full-screen
+/// pager owns the terminal, and writing to stderr underneath it would paint
+/// over its display.
+fn write_stream_to_pager(
+    mut receiver: mpsc::Receiver<StreamOutput>,
+    pager: &str,
+    page_after_lines: usize,
+    mut write_data: impl FnMut(&str) -> Result<()>,
+    mut write_diagnostic: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let mut child: Option<Child> = None;
+    // Output held back until the pager starts or the stream ends.
+    let mut pending: Vec<StreamOutput> = Vec::new();
+    let mut pending_lines = 0;
+    // Diagnostics that arrived while the pager was running.
+    let mut diagnostics = Vec::new();
+    let mut written = Ok(());
+    while let Some(output) = receiver.blocking_recv() {
+        let result = match (output, &mut child) {
+            (StreamOutput::Data(data), Some(child)) => write_to_pager(child, &data),
+            (StreamOutput::Data(data), None) => {
+                pending_lines += data.matches('\n').count();
+                pending.push(StreamOutput::Data(data));
+                if pending_lines >= page_after_lines {
+                    spawn_pager(pager).and_then(|started| {
+                        flush_to_pager(child.insert(started), &mut pending, &mut diagnostics)
+                    })
+                } else {
+                    Ok(())
+                }
+            }
+            (StreamOutput::Diagnostic(diagnostic), Some(_)) => {
+                diagnostics.push(diagnostic);
+                Ok(())
+            }
+            (StreamOutput::Diagnostic(diagnostic), None) => {
+                pending.push(StreamOutput::Diagnostic(diagnostic));
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            written = Err(error);
+            break;
+        }
+    }
+
+    let exited = match child {
+        Some(child) => wait_pager(child),
+        None => {
+            // No pager ever started, so nothing has been shown yet. Write what
+            // was held, and if the pager failed to start, drain the rest unpaged
+            // as well: a display setting must not cancel the query.
+            let flushed = pending.iter().try_for_each(|output| match output {
+                StreamOutput::Data(data) => write_data(data),
+                StreamOutput::Diagnostic(diagnostic) => write_diagnostic(diagnostic),
+            });
+            if written.is_err() {
+                flushed
+                    .and_then(|()| write_stream(receiver, &mut write_data, &mut write_diagnostic))
+            } else {
+                flushed
+            }
+        }
+    };
+    for diagnostic in &diagnostics {
+        write_diagnostic(diagnostic)?;
+    }
+    // A pager that died is reported by its exit status; one the user quit
+    // shows up only as the broken pipe.
+    exited?;
+    written
+}
+
+/// Hands a newly started pager everything held so far. Held diagnostics move
+/// to `diagnostics` to be written once the pager exits.
+fn flush_to_pager(
+    pager: &mut Child,
+    pending: &mut Vec<StreamOutput>,
+    diagnostics: &mut Vec<String>,
+) -> Result<()> {
+    for output in pending.drain(..) {
+        match output {
+            StreamOutput::Data(data) => write_to_pager(pager, &data)?,
+            StreamOutput::Diagnostic(diagnostic) => diagnostics.push(diagnostic),
+        }
+    }
+    Ok(())
+}
+
+fn write_to_pager(pager: &mut Child, data: &str) -> Result<()> {
+    let stdin = pager.stdin.as_mut().expect("pager stdin is piped");
+    stdin.write_all(data.as_bytes()).map_err(|error| {
+        if error.kind() == io::ErrorKind::BrokenPipe {
+            AppError::PagerClosed
+        } else {
+            AppError::Io(error)
+        }
+    })
+}
+
+fn write_diagnostic(diagnostic: &str) -> Result<()> {
+    // PostgreSQL notices are logged to stderr by the connection task, so never
+    // retain this lock while waiting for events.
+    let stderr = io::stderr();
+    let mut stderr = stderr.lock();
+    stderr.write_all(diagnostic.as_bytes())?;
+    stderr.write_all(b"\n")?;
+    stderr.flush()?;
+    Ok(())
 }
 
 fn write_stream(
@@ -413,40 +525,66 @@ fn stdout_error(error: io::Error) -> AppError {
 }
 
 fn should_page(output: &str) -> bool {
-    let height = crossterm::terminal::size()
+    output.lines().count() >= screen_lines()
+}
+
+/// How many lines of output fit on the terminal before paging is worthwhile.
+/// A terminal that reports no height is treated as a standard 24-line one.
+fn screen_lines() -> usize {
+    crossterm::terminal::size()
+        .ok()
         .map(|(_, height)| height as usize)
-        .unwrap_or(24);
-    output.lines().count() >= height.saturating_sub(2)
+        .filter(|height| *height > 0)
+        .unwrap_or(24)
+        .saturating_sub(2)
 }
 
 fn page(output: &str) -> Result<()> {
-    let pager = env::var("PAGER").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "more".into()
-        } else {
-            "less -SRFX".into()
-        }
-    });
-    page_with_command(output, &pager)
+    page_with_command(output, &pager_command())
 }
 
-fn page_with_command(output: &str, pager: &str) -> Result<()> {
+/// `PGLINE_PAGER` overrides `PAGER`, as `PSQL_PAGER` does for psql, so a
+/// CSV-aware pager can be used here without changing it for every other tool.
+fn pager_command() -> String {
+    env::var("PGLINE_PAGER")
+        .or_else(|_| env::var("PAGER"))
+        .unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "more".into()
+            } else {
+                "less -SRFX".into()
+            }
+        })
+}
+
+fn spawn_pager(pager: &str) -> Result<Child> {
     let mut parts = shlex::split(pager)
         .ok_or(AppError::InvalidPager)?
         .into_iter();
     let program = parts.next().ok_or(AppError::InvalidPager)?;
-    let mut child = Command::new(program)
+    Ok(Command::new(program)
         .args(parts)
         .env("LESS", env::var("LESS").unwrap_or_else(|_| "-SRFX".into()))
         .stdin(Stdio::piped())
-        .spawn()?;
-    if let Some(mut stdin) = child.stdin.take()
+        .spawn()?)
+}
+
+fn page_with_command(output: &str, pager: &str) -> Result<()> {
+    let mut child = spawn_pager(pager)?;
+    if let Some(stdin) = child.stdin.as_mut()
         && let Err(error) = stdin.write_all(output.as_bytes())
         && error.kind() != io::ErrorKind::BrokenPipe
     {
         return Err(error.into());
     }
-    let status = child.wait()?;
+    wait_pager(child)
+}
+
+/// Closes the pager's stdin, which tells it the output is complete, and waits
+/// for it to exit.
+fn wait_pager(mut pager: Child) -> Result<()> {
+    drop(pager.stdin.take());
+    let status = pager.wait()?;
     if status.success() {
         Ok(())
     } else {
@@ -621,6 +759,192 @@ mod tests {
             .unwrap_err(),
             AppError::Io(source) if source.kind() == io::ErrorKind::BrokenPipe
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn streamed_output_reports_how_the_pager_ended() {
+        let stream = |data: String| {
+            let (sender, receiver) = mpsc::channel(1);
+            sender.blocking_send(StreamOutput::Data(data)).unwrap();
+            drop(sender);
+            receiver
+        };
+
+        write_stream_to_pager(
+            stream("data".into()),
+            "sh -c 'cat >/dev/null'",
+            0,
+            write_stdout,
+            write_diagnostic,
+        )
+        .unwrap();
+
+        let error = write_stream_to_pager(
+            stream("data".into()),
+            "sh -c 'cat >/dev/null; exit 7'",
+            0,
+            write_stdout,
+            write_diagnostic,
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::PagerExit(status) if !status.success()));
+
+        // More than a pipe buffer's worth, so the write blocks until the pager
+        // exits without reading and the pipe breaks.
+        let error = write_stream_to_pager(
+            stream("x".repeat(1 << 20)),
+            "sh -c 'exit 0'",
+            0,
+            write_stdout,
+            write_diagnostic,
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::PagerClosed));
+
+        // A pager that dies mid-stream also breaks the pipe, but its exit
+        // status is the more useful report.
+        let error = write_stream_to_pager(
+            stream("x".repeat(1 << 20)),
+            "sh -c 'exit 7'",
+            0,
+            write_stdout,
+            write_diagnostic,
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::PagerExit(status) if !status.success()));
+    }
+
+    #[test]
+    fn a_pager_that_cannot_start_falls_back_to_unpaged_output() {
+        let (sender, receiver) = mpsc::channel(3);
+        for output in [
+            StreamOutput::Data("a\n".into()),
+            StreamOutput::Data("b\n".into()),
+            StreamOutput::Diagnostic("(2 rows)".into()),
+        ] {
+            sender.blocking_send(output).unwrap();
+        }
+        drop(sender);
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let error = write_stream_to_pager(
+            receiver,
+            "'",
+            1,
+            |data| {
+                seen.borrow_mut().push(format!("out:{data}"));
+                Ok(())
+            },
+            |diagnostic| {
+                seen.borrow_mut().push(format!("err:{diagnostic}"));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::InvalidPager));
+        assert_eq!(
+            seen.into_inner(),
+            ["out:a\n", "out:b\n", "err:(2 rows)"],
+            "the whole stream was written despite the pager failing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_that_fits_on_screen_is_written_directly_in_order() {
+        // A CSV batch: rows as data, each row count as a diagnostic, then a
+        // table-format statement whose row count travels inside the data.
+        let (sender, receiver) = mpsc::channel(5);
+        for output in [
+            StreamOutput::Data("a\n1\n".into()),
+            StreamOutput::Diagnostic("(1 row)".into()),
+            StreamOutput::Data("b\n2\n".into()),
+            StreamOutput::Diagnostic("(1 row)".into()),
+            StreamOutput::Data("1 row(s) affected\n".into()),
+        ] {
+            sender.blocking_send(output).unwrap();
+        }
+        drop(sender);
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        // A pager that would fail if it were ever started.
+        write_stream_to_pager(
+            receiver,
+            "sh -c 'exit 7'",
+            10,
+            |data| {
+                seen.borrow_mut().push(format!("out:{data}"));
+                Ok(())
+            },
+            |diagnostic| {
+                seen.borrow_mut().push(format!("err:{diagnostic}"));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            seen.into_inner(),
+            [
+                "out:a\n1\n",
+                "err:(1 row)",
+                "out:b\n2\n",
+                "err:(1 row)",
+                "out:1 row(s) affected\n",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_pager_opens_once_output_reaches_a_screen() {
+        let (sender, receiver) = mpsc::channel(3);
+        for _ in 0..3 {
+            sender
+                .blocking_send(StreamOutput::Data("row\n".into()))
+                .unwrap();
+        }
+        drop(sender);
+        let error = write_stream_to_pager(
+            receiver,
+            "sh -c 'cat >/dev/null; exit 7'",
+            3,
+            write_stdout,
+            write_diagnostic,
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::PagerExit(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_wait_until_the_pager_has_exited() {
+        let marker = env::temp_dir().join(format!("pgline-pager-exited-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let (sender, receiver) = mpsc::channel(2);
+        sender
+            .blocking_send(StreamOutput::Data("data".into()))
+            .unwrap();
+        sender
+            .blocking_send(StreamOutput::Diagnostic("(1 row)".into()))
+            .unwrap();
+        drop(sender);
+
+        // The pager leaves a marker as it exits, so a diagnostic written before
+        // then would find no marker.
+        let pager = format!("sh -c 'cat >/dev/null; touch {}'", marker.display());
+        let mut seen = Vec::new();
+        write_stream_to_pager(receiver, &pager, 0, write_stdout, |diagnostic| {
+            assert!(
+                marker.exists(),
+                "diagnostic written while the pager was running"
+            );
+            seen.push(diagnostic.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, ["(1 row)"]);
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[cfg(unix)]

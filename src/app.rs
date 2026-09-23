@@ -44,7 +44,10 @@ pub enum Mode {
     OneShot,
 }
 
-const DEFAULT_MAX_FIELD_WIDTH: usize = 500;
+/// Limits applied at the REPL unless overridden, so an accidental `SELECT *`
+/// at the prompt stays survivable. Scripts get complete output.
+const REPL_ROW_LIMIT: usize = 1000;
+const REPL_MAX_FIELD_WIDTH: usize = 500;
 const METADATA_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const CATALOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -78,7 +81,9 @@ impl App {
         if let Some(sql) = self.cli.execute.clone() {
             if let Some(command) = commands::parse(&sql) {
                 // One-shot runs exit after the command either way.
-                if let CommandOutcome::ReplaceBuffer(query) = self.handle_command(command?).await? {
+                if let CommandOutcome::ReplaceBuffer(query) =
+                    self.handle_command(command?, Mode::OneShot).await?
+                {
                     output::write_stdout(&query)?;
                 }
                 return Ok(());
@@ -141,7 +146,7 @@ impl App {
                     };
                     let is_catalog = matches!(&command, Ok(SpecialCommand::Catalog(_)));
                     let outcome = match command {
-                        Ok(command) => self.handle_command(command).await,
+                        Ok(command) => self.handle_command(command, Mode::Repl).await,
                         Err(error) => Err(error),
                     };
                     match outcome {
@@ -179,7 +184,11 @@ impl App {
         Ok(())
     }
 
-    async fn handle_command(&mut self, command: SpecialCommand) -> Result<CommandOutcome> {
+    async fn handle_command(
+        &mut self,
+        command: SpecialCommand,
+        mode: Mode,
+    ) -> Result<CommandOutcome> {
         match command {
             SpecialCommand::Help => output::write_stdout(commands::HELP)?,
             SpecialCommand::Quit => {
@@ -212,18 +221,22 @@ impl App {
             }
             SpecialCommand::Refresh => self.refresh_metadata().await?,
             SpecialCommand::Connect(database) => return self.reconnect(&database).await,
-            SpecialCommand::Catalog(command) => self.run_catalog_command(&command).await?,
+            SpecialCommand::Catalog(command) => self.run_catalog_command(&command, mode).await?,
         }
         Ok(CommandOutcome::Continue)
     }
 
-    async fn run_catalog_command(&mut self, command: &CatalogCommand) -> Result<()> {
+    async fn run_catalog_command(&mut self, command: &CatalogCommand, mode: Mode) -> Result<()> {
         let catalog = commands::catalog::run(
             &self.database.client,
             command,
             commands::catalog::CatalogLimits {
-                row_limit: self.cli.row_limit,
-                max_field_width: self.cli.max_field_width.unwrap_or(DEFAULT_MAX_FIELD_WIDTH),
+                row_limit: effective_row_limit(mode, self.cli.row_limit),
+                max_field_width: effective_max_field_width(
+                    mode,
+                    Layout::Table,
+                    self.cli.max_field_width,
+                ),
             },
         );
         let outcome = executor::await_cancellable_query(
@@ -354,11 +367,23 @@ impl App {
             return report_or_fail(mode, error, true);
         }
         let query_started = Instant::now();
-        let execution = match self.execute_sql(sql, mode).await {
+        let (execution, written) = self.execute_sql(sql, mode).await;
+        let execution = match execution {
             Ok(execution) => execution,
             Err(error) => {
                 self.transaction =
                     transaction::after_error(self.transaction, sql, 0, standard_conforming_strings);
+                // When the writer failed first, the executor only saw its sink
+                // close; the writer's error is the one worth reporting.
+                let error = match (error, written) {
+                    (AppError::OutputSinkClosed, Err(writer_error)) => writer_error,
+                    (error, _) => error,
+                };
+                // Quitting the pager cancelled the query; at the REPL that is
+                // the user's choice, not an error to report.
+                if mode == Mode::Repl && matches!(error, AppError::PagerClosed) {
+                    return Ok(());
+                }
                 let recoverable = error.as_recoverable_db_error().is_some();
                 return report_or_fail(mode, error, recoverable);
             }
@@ -374,6 +399,24 @@ impl App {
         } else {
             transaction::after_success(self.transaction, sql, standard_conforming_strings)
         };
+        // An output failure says nothing about whether the query ran, so the
+        // transaction state above stands. Quitting the pager cancelled whatever
+        // was still running, and at the REPL that is not an error to report;
+        // any other error the batch hit is.
+        match written {
+            Ok(()) => {}
+            Err(AppError::PagerClosed)
+                if mode == Mode::Repl
+                    && execution
+                        .error
+                        .as_ref()
+                        .is_none_or(executor::is_query_cancelled) =>
+            {
+                return Ok(());
+            }
+            Err(AppError::PagerClosed) if mode == Mode::Repl => {}
+            Err(error) => return Err(error),
+        }
         self.present_execution(&execution, query_started.elapsed())?;
 
         match execution.error {
@@ -386,14 +429,22 @@ impl App {
         }
     }
 
-    async fn execute_sql(&self, sql: &str, mode: Mode) -> Result<executor::Execution> {
+    /// Runs `sql`, returning the query's outcome and the output writer's
+    /// outcome separately: a pager failing says nothing about the query.
+    async fn execute_sql(
+        &self,
+        sql: &str,
+        mode: Mode,
+    ) -> (Result<executor::Execution>, Result<()>) {
         let layout = self.layout();
-        // The REPL buffers human output so it can be paged; everything else
-        // streams to stdout as statements complete.
+        // The REPL buffers human output so it can be paged once its size is
+        // known; everything else streams as statements complete, into the pager
+        // when a person is watching a terminal.
         let (output_sink, writer) = if mode == Mode::Repl && !layout.is_machine_readable() {
             (None, None)
         } else {
-            let (sink, writer) = output::stream_writer();
+            let page = self.pager && io::stdout().is_terminal();
+            let (sink, writer) = output::stream_writer(page);
             (Some(sink), Some(writer))
         };
         let execution = executor::execute(
@@ -403,18 +454,19 @@ impl App {
             executor::ExecutionOptions {
                 format: self.cli.format,
                 expanded: self.expanded,
-                row_limit: self.cli.row_limit,
-                max_field_width: effective_max_field_width(layout, self.cli.max_field_width),
+                row_limit: effective_row_limit(mode, self.cli.row_limit),
+                max_field_width: effective_max_field_width(mode, layout, self.cli.max_field_width),
             },
             output_sink.as_ref(),
         )
         .await;
         // Closing the sink lets the writer thread drain and exit.
         drop(output_sink);
-        if let Some(writer) = writer {
-            writer.await??;
-        }
-        execution
+        let written = match writer {
+            Some(writer) => writer.await.unwrap_or_else(|error| Err(error.into())),
+            None => Ok(()),
+        };
+        (execution, written)
     }
 
     fn present_execution(&self, execution: &executor::Execution, elapsed: Duration) -> Result<()> {
@@ -487,13 +539,20 @@ fn warn_if_metadata_truncated(metadata: &Metadata) {
     }
 }
 
-/// Machine-readable output keeps whole fields unless a width was asked for;
-/// human output truncates long fields by default.
-fn effective_max_field_width(layout: Layout, configured: Option<usize>) -> usize {
-    configured.unwrap_or(if layout.is_machine_readable() {
-        0
+fn effective_row_limit(mode: Mode, configured: Option<usize>) -> usize {
+    configured.unwrap_or(match mode {
+        Mode::Repl => REPL_ROW_LIMIT,
+        Mode::OneShot => 0,
+    })
+}
+
+/// Only human output at the REPL truncates fields by default. Scripts and
+/// machine-readable output keep whole fields unless a width was asked for.
+fn effective_max_field_width(mode: Mode, layout: Layout, configured: Option<usize>) -> usize {
+    configured.unwrap_or(if mode == Mode::Repl && !layout.is_machine_readable() {
+        REPL_MAX_FIELD_WIDTH
     } else {
-        DEFAULT_MAX_FIELD_WIDTH
+        0
     })
 }
 
@@ -596,7 +655,9 @@ mod tests {
         let mut app = App::new(cli, database);
 
         assert_eq!(
-            app.handle_command(SpecialCommand::Refresh).await.unwrap(),
+            app.handle_command(SpecialCommand::Refresh, Mode::Repl)
+                .await
+                .unwrap(),
             CommandOutcome::Continue
         );
 
@@ -822,15 +883,27 @@ mod tests {
     }
 
     #[test]
-    fn machine_output_defaults_follow_expanded_mode() {
+    fn default_limits_apply_only_at_the_repl() {
         let csv = Layout::new(OutputFormat::Csv, false);
         let expanded_csv = Layout::new(OutputFormat::Csv, true);
         let table = Layout::new(OutputFormat::Table, false);
-        assert_eq!(effective_max_field_width(csv, None), 0);
-        assert_eq!(effective_max_field_width(expanded_csv, None), 500);
-        assert_eq!(effective_max_field_width(table, None), 500);
-        assert_eq!(effective_max_field_width(csv, Some(12)), 12);
-        assert_eq!(effective_max_field_width(expanded_csv, Some(12)), 12);
+
+        assert_eq!(effective_row_limit(Mode::Repl, None), 1000);
+        assert_eq!(effective_row_limit(Mode::OneShot, None), 0);
+        assert_eq!(effective_row_limit(Mode::OneShot, Some(7)), 7);
+
+        assert_eq!(effective_max_field_width(Mode::Repl, csv, None), 0);
+        assert_eq!(
+            effective_max_field_width(Mode::Repl, expanded_csv, None),
+            500
+        );
+        assert_eq!(effective_max_field_width(Mode::Repl, table, None), 500);
+        assert_eq!(effective_max_field_width(Mode::OneShot, table, None), 0);
+        assert_eq!(effective_max_field_width(Mode::Repl, csv, Some(12)), 12);
+        assert_eq!(
+            effective_max_field_width(Mode::OneShot, table, Some(12)),
+            12
+        );
     }
 
     #[test]
