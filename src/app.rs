@@ -367,11 +367,18 @@ impl App {
             return report_or_fail(mode, error, true);
         }
         let query_started = Instant::now();
-        let execution = match self.execute_sql(sql, mode).await {
+        let (execution, written) = self.execute_sql(sql, mode).await;
+        let execution = match execution {
             Ok(execution) => execution,
             Err(error) => {
                 self.transaction =
                     transaction::after_error(self.transaction, sql, 0, standard_conforming_strings);
+                // When the writer failed first, the executor only saw its sink
+                // close; the writer's error is the one worth reporting.
+                let error = match (error, written) {
+                    (AppError::OutputSinkClosed, Err(writer_error)) => writer_error,
+                    (error, _) => error,
+                };
                 // Quitting the pager cancelled the query; at the REPL that is
                 // the user's choice, not an error to report.
                 if mode == Mode::Repl && matches!(error, AppError::PagerClosed) {
@@ -392,6 +399,13 @@ impl App {
         } else {
             transaction::after_success(self.transaction, sql, standard_conforming_strings)
         };
+        // An output failure says nothing about whether the query ran, so the
+        // transaction state above stands. Quitting the pager after the query
+        // finished just means the user stopped reading.
+        match written {
+            Ok(()) | Err(AppError::PagerClosed) => {}
+            Err(error) => return Err(error),
+        }
         self.present_execution(&execution, query_started.elapsed())?;
 
         match execution.error {
@@ -404,7 +418,13 @@ impl App {
         }
     }
 
-    async fn execute_sql(&self, sql: &str, mode: Mode) -> Result<executor::Execution> {
+    /// Runs `sql`, returning the query's outcome and the output writer's
+    /// outcome separately: a pager failing says nothing about the query.
+    async fn execute_sql(
+        &self,
+        sql: &str,
+        mode: Mode,
+    ) -> (Result<executor::Execution>, Result<()>) {
         let layout = self.layout();
         // The REPL buffers human output so it can be paged once its size is
         // known; everything else streams as statements complete, into the pager
@@ -413,7 +433,7 @@ impl App {
             (None, None)
         } else {
             let page = self.pager && io::stdout().is_terminal();
-            let (sink, writer) = output::stream_writer(page)?;
+            let (sink, writer) = output::stream_writer(page);
             (Some(sink), Some(writer))
         };
         let execution = executor::execute(
@@ -432,16 +452,10 @@ impl App {
         // Closing the sink lets the writer thread drain and exit.
         drop(output_sink);
         let written = match writer {
-            Some(writer) => writer.await?,
+            Some(writer) => writer.await.unwrap_or_else(|error| Err(error.into())),
             None => Ok(()),
         };
-        match (execution, written) {
-            // The query finished before the pager was quit, so its result
-            // stands even though not all of it was read.
-            (Ok(execution), Ok(()) | Err(AppError::PagerClosed)) => Ok(execution),
-            (_, Err(error)) => Err(error),
-            (execution, Ok(())) => execution,
-        }
+        (execution, written)
     }
 
     fn present_execution(&self, execution: &executor::Execution, elapsed: Duration) -> Result<()> {
@@ -858,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn default_limits_apply_only_to_human_output_at_the_repl() {
+    fn default_limits_apply_only_at_the_repl() {
         let csv = Layout::new(OutputFormat::Csv, false);
         let expanded_csv = Layout::new(OutputFormat::Csv, true);
         let table = Layout::new(OutputFormat::Table, false);
