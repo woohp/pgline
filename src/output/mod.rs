@@ -142,13 +142,14 @@ fn write_stream_to_pager(
     };
     let written = std::iter::from_fn(|| receiver.blocking_recv()).try_for_each(&mut handle);
 
+    // Without a pager, everything held so far is written out, including when
+    // the pager failed to start, so a bad pager setting does not lose output.
     let exited = match child {
         Some(child) => wait_pager(child),
-        None if written.is_ok() => pending.iter().try_for_each(|output| match output {
+        None => pending.iter().try_for_each(|output| match output {
             StreamOutput::Data(data) => write_data(data),
             StreamOutput::Diagnostic(diagnostic) => write_diagnostic(diagnostic),
         }),
-        None => Ok(()),
     };
     for diagnostic in &diagnostics {
         write_diagnostic(diagnostic)?;
