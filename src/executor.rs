@@ -8,7 +8,7 @@ use crate::{
     cli::OutputFormat,
     connection::CancellationTls,
     error::{AppError, Result},
-    output::{self, BoundedBuffer, ResultSet, RetentionBudget},
+    output::{self, ResultSet},
 };
 
 const CANCEL_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -91,10 +91,8 @@ struct ExecutionState<'a> {
     output_sink: Option<&'a mpsc::Sender<output::StreamOutput>>,
     canceller: &'a Canceller,
     current_result: ResultSet,
-    /// Reset for each result set, so one statement's rows cannot starve a later
-    /// statement in the same batch.
-    retention_budget: RetentionBudget,
-    batch: BoundedBuffer,
+    /// Rendered output collected when there is no sink to stream it to.
+    batch: String,
     diagnostics: Vec<String>,
     completed_statements: usize,
     query_error: Option<tokio_postgres::Error>,
@@ -123,8 +121,7 @@ impl<'a> ExecutionState<'a> {
             output_sink,
             canceller,
             current_result: ResultSet::default(),
-            retention_budget: RetentionBudget::for_human_result(),
-            batch: BoundedBuffer::new(output::MAX_INTERACTIVE_BATCH_BYTES, ""),
+            batch: String::new(),
             diagnostics: Vec::new(),
             completed_statements: 0,
             query_error: None,
@@ -155,13 +152,11 @@ impl<'a> ExecutionState<'a> {
     }
 
     async fn begin_result(&mut self, columns: Arc<[SimpleColumn]>) -> Result<()> {
-        self.retention_budget = RetentionBudget::for_human_result();
         self.current_result = ResultSet::with_columns(
             columns
                 .iter()
                 .map(|column| column.name().to_owned())
                 .collect(),
-            &mut self.retention_budget,
         );
         if let Some(delimiter) = self.streamed_delimiter {
             self.send(output::StreamOutput::Data(output::render_delimited_header(
@@ -181,13 +176,12 @@ impl<'a> ExecutionState<'a> {
                 &values,
                 self.options.row_limit,
                 self.options.max_field_width,
-                &mut self.retention_budget,
             );
             return Ok(());
         };
 
         self.current_result.total_rows += 1;
-        if self.options.row_limit != 0 && self.current_result.total_rows > self.options.row_limit {
+        if output::dropped_rows(self.current_result.total_rows, self.options.row_limit) {
             return Ok(());
         }
         let values = (0..row.len())
@@ -239,10 +233,7 @@ impl<'a> ExecutionState<'a> {
                     .await?;
             }
         } else {
-            if !self.batch.is_limited() && !self.batch.push(&rendered.data) {
-                self.diagnostics
-                    .push("interactive batch output limited; additional results omitted".into());
-            }
+            self.batch.push_str(&rendered.data);
             if let Some(diagnostic) = rendered.diagnostic {
                 self.diagnostics.push(diagnostic);
             }
@@ -279,7 +270,7 @@ impl<'a> ExecutionState<'a> {
 
     fn finish(self) -> Execution {
         Execution {
-            output: self.batch.finish(),
+            output: self.batch,
             diagnostics: self.diagnostics,
             completed_statements: self.completed_statements,
             error: self.query_error,
@@ -465,8 +456,6 @@ mod tests {
             output::truncate_field("abcdef", 0),
             ("abcdef".into(), false)
         );
-        assert_eq!(output::retained_field_len("😀😀", 1), 7);
-        assert_eq!(output::retained_field_len("😀😀", 0), 8);
     }
 
     #[tokio::test]
@@ -502,31 +491,19 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
-    async fn enforces_human_output_limits() {
+    async fn applies_the_row_limit_to_human_output() {
         let database = connect().await;
         let execution = execute(
             &database.client,
             &database.canceller(),
-            &format!(
-                "SELECT FROM generate_series(1, {})",
-                output::MAX_HUMAN_RESULT_CELLS + 1
-            ),
-            ExecutionOptions {
-                row_limit: 0,
-                ..options(OutputFormat::Vertical, 500)
-            },
+            "SELECT FROM generate_series(1, 150)",
+            options(OutputFormat::Vertical, 500),
             None,
         )
         .await
         .unwrap();
-        assert!(execution.output.contains(&format!(
-            "({} rows) [output limited]",
-            output::MAX_HUMAN_RESULT_CELLS + 1
-        )));
-        assert_eq!(
-            execution.output.matches("-[ RECORD ").count(),
-            output::MAX_HUMAN_RESULT_CELLS
-        );
+        assert!(execution.output.contains("(150 rows) [rows limited]"));
+        assert_eq!(execution.output.matches("-[ RECORD ").count(), 100);
     }
 
     #[tokio::test]
@@ -611,47 +588,6 @@ mod tests {
         .unwrap();
         assert!(!execution.output.contains('…'));
         assert_eq!(execution.output.matches('x').count(), 600);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires PGLINE_TEST_URL"]
-    async fn enforces_wide_and_oversized_result_limits() {
-        let database = connect().await;
-        let wide_columns = (0..101)
-            .map(|index| format!("g AS c{index}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let execution = execute(
-            &database.client,
-            &database.canceller(),
-            &format!("SELECT {wide_columns} FROM generate_series(1, 1000) AS rows(g)"),
-            ExecutionOptions {
-                row_limit: 0,
-                ..options(OutputFormat::Table, 500)
-            },
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(execution.output.contains("(1000 rows) [output limited]"));
-
-        let execution = execute(
-            &database.client,
-            &database.canceller(),
-            &format!(
-                "SELECT value FROM (VALUES (repeat('x', {})), ('SECOND')) AS rows(value)",
-                output::MAX_HUMAN_RESULT_BYTES + 1
-            ),
-            ExecutionOptions {
-                row_limit: 0,
-                ..options(OutputFormat::Table, 0)
-            },
-            None,
-        )
-        .await
-        .unwrap();
-        assert!(!execution.output.contains("SECOND"));
-        assert!(execution.output.contains("(2 rows) [output limited]"));
     }
 
     #[tokio::test]

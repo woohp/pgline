@@ -5,7 +5,7 @@ use tokio_postgres::{Client, types::ToSql};
 
 use crate::{
     error::{AppError, Result},
-    output::{self, BoundedBuffer, ResultSet, RetentionBudget},
+    output::{self, ResultSet},
 };
 
 use super::{CatalogCommand, RelationKind};
@@ -88,70 +88,48 @@ async fn describe_relations(
     limits: CatalogLimits,
 ) -> Result<String> {
     let pattern = sql_pattern(Some(pattern))?;
-    let mut retention_budget = RetentionBudget::for_human_result();
-    let relations = load_relation_matches(client, &pattern, limits, &mut retention_budget).await?;
+    let relations = load_relation_matches(client, &pattern, limits.max_field_width).await?;
     if relations.is_empty() {
         return Ok(format!("Did not find any relation matching {pattern:?}.\n"));
     }
 
-    let details =
-        load_relation_details(client, &relations, verbose, limits, &mut retention_budget).await?;
+    let details = load_relation_details(client, &relations, verbose, limits).await?;
     Ok(render_relation_descriptions(
-        relations, details, verbose, limits,
+        relations,
+        details,
+        verbose,
+        limits.row_limit,
     ))
 }
 
 async fn load_relation_matches(
     client: &Client,
     pattern: &str,
-    limits: CatalogLimits,
-    retention_budget: &mut RetentionBudget,
+    max_field_width: usize,
 ) -> Result<Vec<RelationDescription>> {
     let rows = client.query_raw(DESCRIBE_MATCHES, [pattern]).await?;
     pin_mut!(rows);
     let mut relations = Vec::new();
-    let mut too_many = false;
     while let Some(row) = rows.next().await {
         let row = row?;
-        if relations.len() == MAX_DESCRIBE_RELATIONS {
-            too_many = true;
-            continue;
-        }
         let definition: Option<&str> = row.get(4);
+        let (view_definition, view_definition_truncated) = match definition {
+            Some(definition) => {
+                let (text, truncated) = output::truncate_field(definition, max_field_width);
+                (Some(text), truncated)
+            }
+            None => (None, false),
+        };
         relations.push(RelationDescription {
             oid: row.get(0),
             schema: row.get(1),
             name: row.get(2),
             kind: row.get(3),
-            view_definition: retain_view_definition(
-                definition,
-                limits.max_field_width,
-                retention_budget,
-            ),
+            view_definition,
+            view_definition_truncated,
         });
     }
-    if too_many {
-        return Err(AppError::InvalidCommand(format!(
-            "describe pattern matched more than {MAX_DESCRIBE_RELATIONS} relations; use a narrower pattern"
-        )));
-    }
     Ok(relations)
-}
-
-fn retain_view_definition(
-    definition: Option<&str>,
-    max_field_width: usize,
-    retention_budget: &mut RetentionBudget,
-) -> ViewDefinition {
-    let Some(definition) = definition else {
-        return ViewDefinition::Absent;
-    };
-    let retained_len = output::retained_field_len(definition, max_field_width);
-    if !retention_budget.take(retained_len, 1) {
-        return ViewDefinition::Limited;
-    }
-    let (text, truncated) = output::truncate_field(definition, max_field_width);
-    ViewDefinition::Retained { text, truncated }
 }
 
 /// Per-relation detail tables keyed by relation OID. Every OID passed to
@@ -169,27 +147,17 @@ async fn load_relation_details(
     relations: &[RelationDescription],
     verbose: bool,
     limits: CatalogLimits,
-    retention_budget: &mut RetentionBudget,
 ) -> Result<RelationDetails> {
     let oids: Vec<u32> = relations.iter().map(|relation| relation.oid).collect();
     let column_sql = describe_columns_sql(verbose);
 
     // Fetch each category for all matching relations at once so wildcard
     // descriptions use a fixed number of network round trips.
-    let columns =
-        query_grouped_tables(client, &column_sql, &oids, limits, retention_budget).await?;
-    let constraints = query_grouped_tables(
-        client,
-        DESCRIBE_CONSTRAINTS,
-        &oids,
-        limits,
-        retention_budget,
-    )
-    .await?;
-    let indexes =
-        query_grouped_tables(client, DESCRIBE_INDEXES, &oids, limits, retention_budget).await?;
+    let columns = query_grouped_tables(client, &column_sql, &oids, limits).await?;
+    let constraints = query_grouped_tables(client, DESCRIBE_CONSTRAINTS, &oids, limits).await?;
+    let indexes = query_grouped_tables(client, DESCRIBE_INDEXES, &oids, limits).await?;
     let storage = if verbose {
-        query_grouped_tables(client, DESCRIBE_DETAILS, &oids, limits, retention_budget).await?
+        query_grouped_tables(client, DESCRIBE_DETAILS, &oids, limits).await?
     } else {
         HashMap::new()
     };
@@ -205,43 +173,39 @@ fn render_relation_descriptions(
     relations: Vec<RelationDescription>,
     mut details: RelationDetails,
     verbose: bool,
-    limits: CatalogLimits,
+    row_limit: usize,
 ) -> String {
-    let mut rendered = catalog_buffer();
+    let mut rendered = String::new();
     for relation in relations {
-        append_relation_description(&mut rendered, relation, &mut details, verbose, limits);
-        if rendered.is_limited() {
-            break;
-        }
+        append_relation_description(&mut rendered, relation, &mut details, verbose, row_limit);
     }
-    rendered.finish()
+    rendered
 }
 
 fn append_relation_description(
-    rendered: &mut BoundedBuffer,
+    rendered: &mut String,
     relation: RelationDescription,
     details: &mut RelationDetails,
     verbose: bool,
-    limits: CatalogLimits,
+    row_limit: usize,
 ) {
     let qualified_name = format!(
         "{}.{}",
         output::quote_identifier(&relation.schema),
         output::quote_identifier(&relation.name)
     );
-    rendered.push(&format!(
+    rendered.push_str(&format!(
         "{} {}\n",
         relation_label(&relation.kind),
         output::safe_terminal_text(&qualified_name)
     ));
 
-    let row_limit = limits.row_limit;
     let take = |tables: &mut HashMap<u32, ResultSet>| {
         tables
             .remove(&relation.oid)
             .expect("details were loaded for every described relation")
     };
-    rendered.push(&output::render_table_output(
+    rendered.push_str(&output::render_table_output(
         &take(&mut details.columns),
         row_limit,
     ));
@@ -257,9 +221,16 @@ fn append_relation_description(
         &take(&mut details.indexes),
         row_limit,
     );
-    append_view_definition(rendered, &relation);
+    if let Some(definition) = &relation.view_definition {
+        rendered.push_str("View definition:\n");
+        rendered.push_str(&output::safe_terminal_text(definition));
+        if relation.view_definition_truncated {
+            rendered.push_str("\n[view definition truncated]");
+        }
+        rendered.push('\n');
+    }
     if verbose {
-        rendered.push(&output::render_table_output(
+        rendered.push_str(&output::render_table_output(
             &take(&mut details.storage),
             row_limit,
         ));
@@ -267,7 +238,7 @@ fn append_relation_description(
 }
 
 fn append_optional_table(
-    rendered: &mut BoundedBuffer,
+    rendered: &mut String,
     heading: &str,
     table: &ResultSet,
     row_limit: usize,
@@ -275,24 +246,8 @@ fn append_optional_table(
     if table.total_rows == 0 {
         return;
     }
-    rendered.push(heading);
-    rendered.push(&output::render_table_output(table, row_limit));
-}
-
-fn append_view_definition(rendered: &mut BoundedBuffer, relation: &RelationDescription) {
-    let mut section = String::from("View definition:\n");
-    match &relation.view_definition {
-        ViewDefinition::Absent => return,
-        ViewDefinition::Retained { text, truncated } => {
-            section.push_str(&output::safe_terminal_text(text));
-            if *truncated {
-                section.push_str("\n[view definition truncated]");
-            }
-            section.push('\n');
-        }
-        ViewDefinition::Limited => section.push_str(CATALOG_OUTPUT_LIMIT_MARKER),
-    }
-    rendered.push(&section);
+    rendered.push_str(heading);
+    rendered.push_str(&output::render_table_output(table, row_limit));
 }
 
 struct RelationDescription {
@@ -300,27 +255,10 @@ struct RelationDescription {
     schema: String,
     name: String,
     kind: String,
-    view_definition: ViewDefinition,
-}
-
-/// A relation's view definition as retained for display, if it has one.
-enum ViewDefinition {
-    Absent,
-    Retained {
-        text: String,
-        truncated: bool,
-    },
-    /// The retention budget was exhausted before the definition could be kept.
-    Limited,
-}
-
-const CATALOG_OUTPUT_LIMIT_MARKER: &str = "[output limited]\n";
-
-fn catalog_buffer() -> BoundedBuffer {
-    BoundedBuffer::new(
-        output::MAX_INTERACTIVE_BATCH_BYTES,
-        CATALOG_OUTPUT_LIMIT_MARKER,
-    )
+    /// The definition of a view or materialized view, already cut to the field
+    /// width.
+    view_definition: Option<String>,
+    view_definition_truncated: bool,
 }
 
 async fn query_grouped_tables(
@@ -328,7 +266,6 @@ async fn query_grouped_tables(
     sql: &str,
     oids: &[u32],
     limits: CatalogLimits,
-    retention_budget: &mut RetentionBudget,
 ) -> Result<HashMap<u32, ResultSet>> {
     let statement = client.prepare(sql).await?;
     let columns: Vec<String> = statement
@@ -339,12 +276,7 @@ async fn query_grouped_tables(
         .collect();
     let mut grouped: HashMap<u32, ResultSet> = oids
         .iter()
-        .map(|oid| {
-            (
-                *oid,
-                ResultSet::with_columns(columns.clone(), retention_budget),
-            )
-        })
+        .map(|oid| (*oid, ResultSet::with_columns(columns.clone())))
         .collect();
     let rows = client.query_raw(&statement, [oids]).await?;
     pin_mut!(rows);
@@ -358,12 +290,7 @@ async fn query_grouped_tables(
             ))
         })?;
         let values: Vec<Option<&str>> = (1..row.len()).map(|index| row.get(index)).collect();
-        result.retain_human_row(
-            &values,
-            limits.row_limit,
-            limits.max_field_width,
-            retention_budget,
-        );
+        result.retain_human_row(&values, limits.row_limit, limits.max_field_width);
     }
 
     Ok(grouped)
@@ -384,21 +311,13 @@ async fn query_table(
     let rows = client.query_raw(&statement, params.iter().copied()).await?;
     pin_mut!(rows);
 
-    let mut budget = RetentionBudget::for_human_result();
-    let mut result = ResultSet::with_columns(columns, &mut budget);
+    let mut result = ResultSet::with_columns(columns);
     while let Some(row) = rows.next().await {
         let row = row?;
         let values: Vec<Option<&str>> = (0..row.len()).map(|index| row.get(index)).collect();
-        result.retain_human_row(
-            &values,
-            limits.row_limit,
-            limits.max_field_width,
-            &mut budget,
-        );
+        result.retain_human_row(&values, limits.row_limit, limits.max_field_width);
     }
-    let mut rendered = catalog_buffer();
-    rendered.push_truncated(&output::render_table_output(&result, limits.row_limit));
-    Ok(rendered.finish())
+    Ok(output::render_table_output(&result, limits.row_limit))
 }
 
 pub fn sql_pattern(pattern: Option<&str>) -> Result<String> {
@@ -473,8 +392,6 @@ ORDER BY 1, 2
     )
 }
 
-const MAX_DESCRIBE_RELATIONS: usize = 100;
-
 const DESCRIBE_MATCHES: &str = r#"
 SELECT c.oid, n.nspname::text, c.relname::text, c.relkind::text,
        CASE WHEN c.relkind IN ('v', 'm') THEN pg_get_viewdef(c.oid, true) END::text
@@ -483,7 +400,6 @@ JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind IN ('r','p','v','m','S','f','i','I')
   AND (c.relname LIKE $1 ESCAPE E'\\' OR (n.nspname || '.' || c.relname) LIKE $1 ESCAPE E'\\')
 ORDER BY n.nspname, c.relname
-LIMIT 101
 "#;
 
 fn describe_columns_sql(verbose: bool) -> String {
@@ -596,16 +512,6 @@ mod tests {
         assert_eq!(sql_pattern(Some("\"literal*?\"")).unwrap(), "literal*?");
         assert_eq!(sql_pattern(Some("\"a\"\"b\"")).unwrap(), "a\"b");
         assert!(sql_pattern(Some("\"unfinished")).is_err());
-    }
-
-    #[test]
-    fn combined_catalog_output_stays_within_the_interactive_batch_limit() {
-        let mut rendered = catalog_buffer();
-        rendered.push(&"x".repeat(output::MAX_INTERACTIVE_BATCH_BYTES));
-
-        let rendered = rendered.finish();
-        assert!(rendered.len() <= output::MAX_INTERACTIVE_BATCH_BYTES);
-        assert!(rendered.ends_with(CATALOG_OUTPUT_LIMIT_MARKER));
     }
 
     #[tokio::test]
