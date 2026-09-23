@@ -400,10 +400,11 @@ impl App {
             transaction::after_success(self.transaction, sql, standard_conforming_strings)
         };
         // An output failure says nothing about whether the query ran, so the
-        // transaction state above stands. Quitting the pager after the query
-        // finished just means the user stopped reading.
+        // transaction state above stands. Quitting the pager cancelled whatever
+        // was still running, and at the REPL that is not an error to report.
         match written {
-            Ok(()) | Err(AppError::PagerClosed) => {}
+            Ok(()) => {}
+            Err(AppError::PagerClosed) if mode == Mode::Repl => return Ok(()),
             Err(error) => return Err(error),
         }
         self.present_execution(&execution, query_started.elapsed())?;

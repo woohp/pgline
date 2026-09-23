@@ -109,38 +109,40 @@ fn write_stream_to_pager(
     mut write_diagnostic: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     let mut child: Option<Child> = None;
+    // Output held back until the pager starts or the stream ends.
     let mut pending: Vec<StreamOutput> = Vec::new();
     let mut pending_lines = 0;
+    // Diagnostics that arrived while the pager was running.
     let mut diagnostics = Vec::new();
-    let mut handle = |output: StreamOutput| -> Result<()> {
-        match output {
-            StreamOutput::Data(data) => {
-                if let Some(child) = &mut child {
-                    return write_to_pager(child, &data);
-                }
+    let mut written = Ok(());
+    while let Some(output) = receiver.blocking_recv() {
+        let result = match (output, &mut child) {
+            (StreamOutput::Data(data), Some(child)) => write_to_pager(child, &data),
+            (StreamOutput::Data(data), None) => {
                 pending_lines += data.matches('\n').count();
                 pending.push(StreamOutput::Data(data));
                 if pending_lines >= page_after_lines {
-                    let started = child.insert(spawn_pager(pager)?);
-                    for output in pending.drain(..) {
-                        match output {
-                            StreamOutput::Data(data) => write_to_pager(started, &data)?,
-                            StreamOutput::Diagnostic(diagnostic) => diagnostics.push(diagnostic),
-                        }
-                    }
-                }
-            }
-            StreamOutput::Diagnostic(diagnostic) => {
-                if child.is_some() {
-                    diagnostics.push(diagnostic);
+                    spawn_pager(pager).and_then(|started| {
+                        flush_to_pager(child.insert(started), &mut pending, &mut diagnostics)
+                    })
                 } else {
-                    pending.push(StreamOutput::Diagnostic(diagnostic));
+                    Ok(())
                 }
             }
+            (StreamOutput::Diagnostic(diagnostic), Some(_)) => {
+                diagnostics.push(diagnostic);
+                Ok(())
+            }
+            (StreamOutput::Diagnostic(diagnostic), None) => {
+                pending.push(StreamOutput::Diagnostic(diagnostic));
+                Ok(())
+            }
+        };
+        if let Err(error) = result {
+            written = Err(error);
+            break;
         }
-        Ok(())
-    };
-    let written = std::iter::from_fn(|| receiver.blocking_recv()).try_for_each(&mut handle);
+    }
 
     // Without a pager, everything held so far is written out, including when
     // the pager failed to start, so a bad pager setting does not lose output.
@@ -156,6 +158,22 @@ fn write_stream_to_pager(
     }
     written?;
     exited
+}
+
+/// Hands a newly started pager everything held so far. Held diagnostics move
+/// to `diagnostics` to be written once the pager exits.
+fn flush_to_pager(
+    pager: &mut Child,
+    pending: &mut Vec<StreamOutput>,
+    diagnostics: &mut Vec<String>,
+) -> Result<()> {
+    for output in pending.drain(..) {
+        match output {
+            StreamOutput::Data(data) => write_to_pager(pager, &data)?,
+            StreamOutput::Diagnostic(diagnostic) => diagnostics.push(diagnostic),
+        }
+    }
+    Ok(())
 }
 
 fn write_to_pager(pager: &mut Child, data: &str) -> Result<()> {
