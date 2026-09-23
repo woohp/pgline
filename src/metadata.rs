@@ -8,10 +8,7 @@ use tokio_postgres::{Client, types::ToSql};
 
 use crate::{error::Result, output};
 
-const SCHEMA_LIMIT: usize = 1_000;
-const RELATION_LIMIT: usize = 5_000;
-const COLUMN_LIMIT: usize = 50_000;
-
+/// Caps on how many names are loaded for completion.
 #[derive(Clone, Copy)]
 struct MetadataLimits {
     schemas: usize,
@@ -20,9 +17,9 @@ struct MetadataLimits {
 }
 
 const METADATA_LIMITS: MetadataLimits = MetadataLimits {
-    schemas: SCHEMA_LIMIT,
-    relations: RELATION_LIMIT,
-    columns: COLUMN_LIMIT,
+    schemas: 1_000,
+    relations: 5_000,
+    columns: 50_000,
 };
 
 #[derive(Debug, Clone, Default)]

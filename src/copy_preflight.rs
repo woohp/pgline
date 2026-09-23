@@ -4,7 +4,7 @@ pub(crate) fn unsupported_copy_error(
     sql: &str,
     standard_conforming_strings: bool,
 ) -> Option<AppError> {
-    let scan = scanner::scan_with_standard_conforming_strings(sql, standard_conforming_strings);
+    let scan = scanner::scan(sql, standard_conforming_strings);
     let mut state = CopyScanState::default();
 
     for token in scan.tokens {

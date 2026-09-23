@@ -35,17 +35,30 @@ pub async fn run(
             verbose,
         } => list_relations(client, *kind, pattern.as_deref(), *verbose, limits).await,
         CatalogCommand::Functions { pattern } => {
-            list_functions(client, pattern.as_deref(), limits).await
+            list_matching(client, LIST_FUNCTIONS, pattern.as_deref(), limits).await
         }
         CatalogCommand::Schemas { pattern } => {
-            list_schemas(client, pattern.as_deref(), limits).await
+            list_matching(client, LIST_SCHEMAS, pattern.as_deref(), limits).await
         }
         CatalogCommand::Databases { pattern } => {
-            list_databases(client, pattern.as_deref(), limits).await
+            list_matching(client, LIST_DATABASES, pattern.as_deref(), limits).await
         }
-        CatalogCommand::Roles { pattern } => list_roles(client, pattern.as_deref(), limits).await,
-        CatalogCommand::ConnectionInfo => connection_info(client, limits).await,
+        CatalogCommand::Roles { pattern } => {
+            list_matching(client, LIST_ROLES, pattern.as_deref(), limits).await
+        }
+        CatalogCommand::ConnectionInfo => query_table(client, CONNECTION_INFO, &[], limits).await,
     }
+}
+
+/// Runs a listing query whose only parameter is the name pattern.
+async fn list_matching(
+    client: &Client,
+    sql: &str,
+    pattern: Option<&str>,
+    limits: CatalogLimits,
+) -> Result<String> {
+    let pattern = sql_pattern(pattern)?;
+    query_table(client, sql, &[&pattern], limits).await
 }
 
 async fn list_relations(
@@ -64,12 +77,8 @@ async fn list_relations(
         RelationKind::Index => vec!["i", "I"],
         RelationKind::Sequence => vec!["S"],
     };
-    let sql = if verbose {
-        LIST_RELATIONS_VERBOSE
-    } else {
-        LIST_RELATIONS
-    };
-    query_table(client, sql, &[&kinds, &pattern], limits).await
+    let sql = list_relations_sql(verbose);
+    query_table(client, &sql, &[&kinds, &pattern], limits).await
 }
 
 async fn describe_relations(
@@ -87,7 +96,9 @@ async fn describe_relations(
 
     let details =
         load_relation_details(client, &relations, verbose, limits, &mut retention_budget).await?;
-    render_relation_descriptions(relations, details, verbose, limits)
+    Ok(render_relation_descriptions(
+        relations, details, verbose, limits,
+    ))
 }
 
 async fn load_relation_matches(
@@ -143,12 +154,14 @@ fn retain_view_definition(
     ViewDefinition::Retained { text, truncated }
 }
 
+/// Per-relation detail tables keyed by relation OID. Every OID passed to
+/// [`load_relation_details`] has an entry in each map, even if empty.
 struct RelationDetails {
-    columns: HashMap<u32, CatalogTable>,
-    constraints: HashMap<u32, CatalogTable>,
-    indexes: HashMap<u32, CatalogTable>,
+    columns: HashMap<u32, ResultSet>,
+    constraints: HashMap<u32, ResultSet>,
+    indexes: HashMap<u32, ResultSet>,
     /// Storage and size columns, populated only for the `+` command forms.
-    storage: HashMap<u32, CatalogTable>,
+    storage: HashMap<u32, ResultSet>,
 }
 
 async fn load_relation_details(
@@ -159,15 +172,12 @@ async fn load_relation_details(
     retention_budget: &mut RetentionBudget,
 ) -> Result<RelationDetails> {
     let oids: Vec<u32> = relations.iter().map(|relation| relation.oid).collect();
-    let column_sql = if verbose {
-        DESCRIBE_COLUMNS_VERBOSE
-    } else {
-        DESCRIBE_COLUMNS
-    };
+    let column_sql = describe_columns_sql(verbose);
 
     // Fetch each category for all matching relations at once so wildcard
     // descriptions use a fixed number of network round trips.
-    let columns = query_grouped_tables(client, column_sql, &oids, limits, retention_budget).await?;
+    let columns =
+        query_grouped_tables(client, &column_sql, &oids, limits, retention_budget).await?;
     let constraints = query_grouped_tables(
         client,
         DESCRIBE_CONSTRAINTS,
@@ -196,15 +206,15 @@ fn render_relation_descriptions(
     mut details: RelationDetails,
     verbose: bool,
     limits: CatalogLimits,
-) -> Result<String> {
+) -> String {
     let mut rendered = catalog_buffer();
     for relation in relations {
-        append_relation_description(&mut rendered, relation, &mut details, verbose, limits)?;
+        append_relation_description(&mut rendered, relation, &mut details, verbose, limits);
         if rendered.is_limited() {
             break;
         }
     }
-    Ok(rendered.finish())
+    rendered.finish()
 }
 
 fn append_relation_description(
@@ -213,7 +223,7 @@ fn append_relation_description(
     details: &mut RelationDetails,
     verbose: bool,
     limits: CatalogLimits,
-) -> Result<()> {
+) {
     let qualified_name = format!(
         "{}.{}",
         output::quote_identifier(&relation.schema),
@@ -225,39 +235,48 @@ fn append_relation_description(
         output::safe_terminal_text(&qualified_name)
     ));
 
-    let columns = take_catalog_table(&mut details.columns, relation.oid, "columns")?;
-    rendered.push(&columns.render(limits.row_limit));
-    append_optional_catalog_table(
+    let row_limit = limits.row_limit;
+    let take = |tables: &mut HashMap<u32, ResultSet>| {
+        tables
+            .remove(&relation.oid)
+            .expect("details were loaded for every described relation")
+    };
+    rendered.push(&output::render_table_output(
+        &take(&mut details.columns),
+        row_limit,
+    ));
+    append_optional_table(
         rendered,
         "\nConstraints:\n",
-        take_catalog_table(&mut details.constraints, relation.oid, "constraints")?,
-        limits.row_limit,
+        &take(&mut details.constraints),
+        row_limit,
     );
-    append_optional_catalog_table(
+    append_optional_table(
         rendered,
         "\nIndexes:\n",
-        take_catalog_table(&mut details.indexes, relation.oid, "indexes")?,
-        limits.row_limit,
+        &take(&mut details.indexes),
+        row_limit,
     );
     append_view_definition(rendered, &relation);
     if verbose {
-        let storage = take_catalog_table(&mut details.storage, relation.oid, "details")?;
-        rendered.push(&storage.render(limits.row_limit));
+        rendered.push(&output::render_table_output(
+            &take(&mut details.storage),
+            row_limit,
+        ));
     }
-    Ok(())
 }
 
-fn append_optional_catalog_table(
+fn append_optional_table(
     rendered: &mut BoundedBuffer,
     heading: &str,
-    table: CatalogTable,
+    table: &ResultSet,
     row_limit: usize,
 ) {
-    if table.total_rows() == 0 {
+    if table.total_rows == 0 {
         return;
     }
     rendered.push(heading);
-    rendered.push(&table.render(row_limit));
+    rendered.push(&output::render_table_output(table, row_limit));
 }
 
 fn append_view_definition(rendered: &mut BoundedBuffer, relation: &RelationDescription) {
@@ -274,46 +293,6 @@ fn append_view_definition(rendered: &mut BoundedBuffer, relation: &RelationDescr
         ViewDefinition::Limited => section.push_str(CATALOG_OUTPUT_LIMIT_MARKER),
     }
     rendered.push(&section);
-}
-
-async fn list_functions(
-    client: &Client,
-    pattern: Option<&str>,
-    limits: CatalogLimits,
-) -> Result<String> {
-    let pattern = sql_pattern(pattern)?;
-    query_table(client, LIST_FUNCTIONS, &[&pattern], limits).await
-}
-
-async fn list_schemas(
-    client: &Client,
-    pattern: Option<&str>,
-    limits: CatalogLimits,
-) -> Result<String> {
-    let pattern = sql_pattern(pattern)?;
-    query_table(client, LIST_SCHEMAS, &[&pattern], limits).await
-}
-
-async fn list_databases(
-    client: &Client,
-    pattern: Option<&str>,
-    limits: CatalogLimits,
-) -> Result<String> {
-    let pattern = sql_pattern(pattern)?;
-    query_table(client, LIST_DATABASES, &[&pattern], limits).await
-}
-
-async fn list_roles(
-    client: &Client,
-    pattern: Option<&str>,
-    limits: CatalogLimits,
-) -> Result<String> {
-    let pattern = sql_pattern(pattern)?;
-    query_table(client, LIST_ROLES, &[&pattern], limits).await
-}
-
-async fn connection_info(client: &Client, limits: CatalogLimits) -> Result<String> {
-    query_table(client, CONNECTION_INFO, &[], limits).await
 }
 
 struct RelationDescription {
@@ -337,32 +316,6 @@ enum ViewDefinition {
 
 const CATALOG_OUTPUT_LIMIT_MARKER: &str = "[output limited]\n";
 
-struct CatalogTable {
-    result: ResultSet,
-}
-
-impl CatalogTable {
-    fn total_rows(&self) -> usize {
-        self.result.total_rows
-    }
-
-    fn render(&self, row_limit: usize) -> String {
-        output::render_table_output(&self.result, row_limit)
-    }
-}
-
-fn take_catalog_table(
-    tables: &mut HashMap<u32, CatalogTable>,
-    oid: u32,
-    category: &str,
-) -> Result<CatalogTable> {
-    tables.remove(&oid).ok_or_else(|| {
-        AppError::Internal(format!(
-            "catalog query omitted {category} for relation OID {oid}"
-        ))
-    })
-}
-
 fn catalog_buffer() -> BoundedBuffer {
     BoundedBuffer::new(
         output::MAX_INTERACTIVE_BATCH_BYTES,
@@ -376,7 +329,7 @@ async fn query_grouped_tables(
     oids: &[u32],
     limits: CatalogLimits,
     retention_budget: &mut RetentionBudget,
-) -> Result<HashMap<u32, CatalogTable>> {
+) -> Result<HashMap<u32, ResultSet>> {
     let statement = client.prepare(sql).await?;
     let columns: Vec<String> = statement
         .columns()
@@ -413,10 +366,7 @@ async fn query_grouped_tables(
         );
     }
 
-    Ok(grouped
-        .into_iter()
-        .map(|(oid, result)| (oid, CatalogTable { result }))
-        .collect())
+    Ok(grouped)
 }
 
 async fn query_table(
@@ -425,18 +375,6 @@ async fn query_table(
     params: &[&(dyn ToSql + Sync)],
     limits: CatalogLimits,
 ) -> Result<String> {
-    let table = query_table_result(client, sql, params, limits).await?;
-    let mut rendered = catalog_buffer();
-    rendered.push_truncated(&table.render(limits.row_limit));
-    Ok(rendered.finish())
-}
-
-async fn query_table_result(
-    client: &Client,
-    sql: &str,
-    params: &[&(dyn ToSql + Sync)],
-    limits: CatalogLimits,
-) -> Result<CatalogTable> {
     let statement = client.prepare(sql).await?;
     let columns = statement
         .columns()
@@ -458,7 +396,9 @@ async fn query_table_result(
             &mut budget,
         );
     }
-    Ok(CatalogTable { result })
+    let mut rendered = catalog_buffer();
+    rendered.push_truncated(&output::render_table_output(&result, limits.row_limit));
+    Ok(rendered.finish())
 }
 
 pub fn sql_pattern(pattern: Option<&str>) -> Result<String> {
@@ -506,39 +446,32 @@ fn relation_label(kind: &str) -> &'static str {
 
 // Explicit E strings make the LIKE escape character independent of the
 // session's standard_conforming_strings setting.
-const LIST_RELATIONS: &str = r#"
-SELECT n.nspname::text AS "Schema",
-       c.relname::text AS "Name",
-       CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
-         WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence'
-         WHEN 'f' THEN 'foreign table' WHEN 'i' THEN 'index' WHEN 'I' THEN 'partitioned index'
-         ELSE c.relkind::text END::text AS "Type",
-       pg_get_userbyid(c.relowner)::text AS "Owner"
-FROM pg_catalog.pg_class c
-JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-WHERE c.relkind::text = ANY($1)
-  AND (c.relname LIKE $2 ESCAPE E'\\' OR (n.nspname || '.' || c.relname) LIKE $2 ESCAPE E'\\')
-  AND ($2 <> '%' OR (n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'))
-ORDER BY 1, 2
-"#;
-
-const LIST_RELATIONS_VERBOSE: &str = r#"
-SELECT n.nspname::text AS "Schema",
-       c.relname::text AS "Name",
-       CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
-         WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence'
-         WHEN 'f' THEN 'foreign table' WHEN 'i' THEN 'index' WHEN 'I' THEN 'partitioned index'
-         ELSE c.relkind::text END::text AS "Type",
-       pg_get_userbyid(c.relowner)::text AS "Owner",
+fn list_relations_sql(verbose: bool) -> String {
+    let verbose_columns = if verbose {
+        r#",
        pg_size_pretty(pg_total_relation_size(c.oid))::text AS "Size",
-       obj_description(c.oid, 'pg_class')::text AS "Description"
+       obj_description(c.oid, 'pg_class')::text AS "Description""#
+    } else {
+        ""
+    };
+    format!(
+        r#"
+SELECT n.nspname::text AS "Schema",
+       c.relname::text AS "Name",
+       CASE c.relkind WHEN 'r' THEN 'table' WHEN 'p' THEN 'partitioned table'
+         WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' WHEN 'S' THEN 'sequence'
+         WHEN 'f' THEN 'foreign table' WHEN 'i' THEN 'index' WHEN 'I' THEN 'partitioned index'
+         ELSE c.relkind::text END::text AS "Type",
+       pg_get_userbyid(c.relowner)::text AS "Owner"{verbose_columns}
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 WHERE c.relkind::text = ANY($1)
   AND (c.relname LIKE $2 ESCAPE E'\\' OR (n.nspname || '.' || c.relname) LIKE $2 ESCAPE E'\\')
   AND ($2 <> '%' OR (n.nspname !~ '^pg_' AND n.nspname <> 'information_schema'))
 ORDER BY 1, 2
-"#;
+"#
+    )
+}
 
 const MAX_DESCRIBE_RELATIONS: usize = 100;
 
@@ -553,30 +486,28 @@ ORDER BY n.nspname, c.relname
 LIMIT 101
 "#;
 
-const DESCRIBE_COLUMNS: &str = r#"
-SELECT a.attrelid, a.attname::text AS "Column",
-       pg_catalog.format_type(a.atttypid, a.atttypmod)::text AS "Type",
-       CASE WHEN a.attnotnull THEN 'not null' ELSE '' END::text AS "Nullable",
-       pg_get_expr(d.adbin, d.adrelid)::text AS "Default"
-FROM pg_catalog.pg_attribute a
-LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-WHERE a.attrelid = ANY($1) AND a.attnum > 0 AND NOT a.attisdropped
-ORDER BY pg_catalog.array_position($1, a.attrelid), a.attnum
-"#;
-
-const DESCRIBE_COLUMNS_VERBOSE: &str = r#"
-SELECT a.attrelid, a.attname::text AS "Column",
-       pg_catalog.format_type(a.atttypid, a.atttypmod)::text AS "Type",
-       CASE WHEN a.attnotnull THEN 'not null' ELSE '' END::text AS "Nullable",
-       pg_get_expr(d.adbin, d.adrelid)::text AS "Default",
+fn describe_columns_sql(verbose: bool) -> String {
+    let verbose_columns = if verbose {
+        r#",
        CASE a.attstorage WHEN 'p' THEN 'plain' WHEN 'e' THEN 'external'
          WHEN 'm' THEN 'main' WHEN 'x' THEN 'extended' END::text AS "Storage",
-       col_description(a.attrelid, a.attnum)::text AS "Description"
+       col_description(a.attrelid, a.attnum)::text AS "Description""#
+    } else {
+        ""
+    };
+    format!(
+        r#"
+SELECT a.attrelid, a.attname::text AS "Column",
+       pg_catalog.format_type(a.atttypid, a.atttypmod)::text AS "Type",
+       CASE WHEN a.attnotnull THEN 'not null' ELSE '' END::text AS "Nullable",
+       pg_get_expr(d.adbin, d.adrelid)::text AS "Default"{verbose_columns}
 FROM pg_catalog.pg_attribute a
 LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
 WHERE a.attrelid = ANY($1) AND a.attnum > 0 AND NOT a.attisdropped
 ORDER BY pg_catalog.array_position($1, a.attrelid), a.attnum
-"#;
+"#
+    )
+}
 
 const DESCRIBE_CONSTRAINTS: &str = r#"
 SELECT conrelid, conname::text AS "Name", pg_get_constraintdef(oid, true)::text AS "Definition"

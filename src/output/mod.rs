@@ -251,17 +251,13 @@ pub enum StreamOutput {
     Diagnostic(String),
 }
 
-pub struct StreamWriter {
-    task: tokio::task::JoinHandle<Result<()>>,
-}
-
-impl StreamWriter {
-    pub async fn finish(self) -> Result<()> {
-        self.task.await?
-    }
-}
-
-pub fn stream_writer() -> (mpsc::Sender<StreamOutput>, StreamWriter) {
+/// Starts a blocking writer thread that copies streamed output to stdout and
+/// stderr. Dropping the sender ends the thread; await the handle to collect
+/// any write error.
+pub fn stream_writer() -> (
+    mpsc::Sender<StreamOutput>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
     let (sender, receiver) = mpsc::channel(8);
     let task = tokio::task::spawn_blocking(move || {
         write_stream(
@@ -284,7 +280,7 @@ pub fn stream_writer() -> (mpsc::Sender<StreamOutput>, StreamWriter) {
             },
         )
     });
-    (sender, StreamWriter { task })
+    (sender, task)
 }
 
 fn write_stream(

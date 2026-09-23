@@ -54,6 +54,9 @@ impl Database {
     }
 }
 
+/// Every target of a multi-host connection string failed. The most
+/// informative error is the one reported, since an authentication failure on
+/// one host says more than a timeout on another.
 #[derive(Debug)]
 struct ConnectAttemptsError {
     errors: Vec<tokio_postgres::Error>,
@@ -61,22 +64,21 @@ struct ConnectAttemptsError {
 }
 
 impl ConnectAttemptsError {
-    fn preferred(&self) -> &tokio_postgres::Error {
+    fn preferred_index(&self) -> usize {
         self.errors
-            .iter()
-            .max_by_key(|error| connection_error_priority(error))
-            .expect("a failed connection has an error")
-    }
-
-    fn into_preferred(self) -> tokio_postgres::Error {
-        let index = self
-            .errors
             .iter()
             .enumerate()
             .max_by_key(|(_, error)| connection_error_priority(error))
             .map(|(index, _)| index)
-            .expect("a failed connection has an error");
-        self.errors.into_iter().nth(index).unwrap()
+            .expect("a failed connection has an error")
+    }
+
+    fn preferred(&self) -> &tokio_postgres::Error {
+        &self.errors[self.preferred_index()]
+    }
+
+    fn into_preferred(mut self) -> tokio_postgres::Error {
+        self.errors.swap_remove(self.preferred_index())
     }
 }
 
@@ -88,7 +90,12 @@ impl std::fmt::Display for ConnectAttemptsError {
 
 const STARTUP_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-type Connected = (Client, CancellationTls, Arc<AtomicBool>);
+/// A live connection before its metadata has been queried.
+struct Connected {
+    client: Client,
+    tls: CancellationTls,
+    standard_conforming_strings: Arc<AtomicBool>,
+}
 
 pub async fn connect(cli: &Cli) -> Result<Database> {
     connect_configured(base_config(cli)?, cli.password, !cli.no_password).await
@@ -117,18 +124,21 @@ async fn connect_configured(
     } else {
         None
     };
-    let (client, tls, standard_conforming_strings) =
-        match connect_config_with_interrupt(&config, rustls.as_ref()).await? {
-            Ok(connected) => connected,
-            Err(error) if should_retry_with_password(password_prompt_allowed, &config, &error) => {
-                let password = rpassword::prompt_password("Password: ")?;
-                config.password(password);
-                connect_config_with_interrupt(&config, rustls.as_ref())
-                    .await?
-                    .map_err(ConnectAttemptsError::into_preferred)?
-            }
-            Err(error) => return Err(error.into_preferred().into()),
-        };
+    let Connected {
+        client,
+        tls,
+        standard_conforming_strings,
+    } = match connect_config_with_interrupt(&config, rustls.as_ref()).await? {
+        Ok(connected) => connected,
+        Err(error) if should_retry_with_password(password_prompt_allowed, &config, &error) => {
+            let password = rpassword::prompt_password("Password: ")?;
+            config.password(password);
+            connect_config_with_interrupt(&config, rustls.as_ref())
+                .await?
+                .map_err(ConnectAttemptsError::into_preferred)?
+        }
+        Err(error) => return Err(error.into_preferred().into()),
+    };
 
     // Password-file credentials are added only to per-target attempts. The
     // reusable config therefore preserves all targets and re-evaluates
@@ -203,19 +213,6 @@ async fn query_connection_info(
             Err(AppError::Cancellation(reason))
         }
     }
-}
-
-#[cfg(test)]
-async fn connect_config(
-    config: &Config,
-    rustls: Option<&MakeRustlsConnect>,
-) -> std::result::Result<Connected, ConnectAttemptsError> {
-    let password_file = if config.get_password().is_some() {
-        PasswordFile::empty()
-    } else {
-        PasswordFile::load()
-    };
-    connect_config_with_password_file(config, rustls, &password_file).await
 }
 
 async fn connect_config_with_password_file(
@@ -297,7 +294,11 @@ where
     tokio::spawn(async move {
         drive_connection(&mut connection, &observed_setting).await;
     });
-    (client, tls, standard_conforming_strings)
+    Connected {
+        client,
+        tls,
+        standard_conforming_strings,
+    }
 }
 
 async fn drive_connection<S, T>(
@@ -316,16 +317,22 @@ async fn drive_connection<S, T>(
             message
         })
         .await;
+        // Each eprintln! takes the stderr lock only for the duration of the
+        // call, so the output writer thread is never blocked behind this task.
         match message {
             Some(Ok(AsyncMessage::Notice(notice))) => {
-                let severity = output::safe_terminal_text(notice.severity());
-                let message = output::safe_terminal_text(notice.message());
-                tracing::info!("{severity}: {message}");
+                eprintln!(
+                    "{}: {}",
+                    output::safe_terminal_text(notice.severity()),
+                    output::safe_terminal_text(notice.message())
+                );
             }
             Some(Ok(AsyncMessage::Notification(_))) => {}
             Some(Err(error)) => {
-                let error = output::safe_terminal_text(&error.to_string());
-                tracing::error!(%error, "PostgreSQL connection closed");
+                eprintln!(
+                    "PostgreSQL connection closed: {}",
+                    output::safe_terminal_text(&error.to_string())
+                );
                 break;
             }
             None => break,
@@ -398,20 +405,23 @@ mod tests {
         config.hostaddr("127.0.0.1".parse().unwrap());
         config.ssl_mode(SslMode::Disable);
         let tls = MakeRustlsConnect::new(config_platform_verifier().unwrap());
-        let (client, selected_tls, _) = connect_config(&config, Some(&tls)).await.unwrap();
+        let Connected {
+            client,
+            tls: selected_tls,
+            ..
+        } = connect_config_with_interrupt(&config, Some(&tls))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(matches!(selected_tls, CancellationTls::Disabled));
-        assert_eq!(
-            client
-                .query_one("SELECT 1", &[])
-                .await
-                .unwrap()
-                .get::<_, i32>(0),
-            1
-        );
+        crate::test_support::assert_connection_usable(&client).await;
 
         config.ssl_mode(SslMode::Require);
         supply_tls_hosts_for_hostaddrs(&mut config);
-        if let Err(error) = connect_config(&config, Some(&tls)).await {
+        if let Err(error) = connect_config_with_interrupt(&config, Some(&tls))
+            .await
+            .unwrap()
+        {
             assert!(!error.to_string().contains("invalid dns name"));
         }
     }
@@ -437,18 +447,12 @@ mod tests {
         config.ssl_mode(SslMode::Disable);
 
         let password_file = PasswordFile::matching_all(password);
-        let (client, _, _) = connect_config_with_password_file(&config, None, &password_file)
-            .await
-            .unwrap();
-        assert!(config.get_password().is_none());
-        assert_eq!(
-            client
-                .query_one("SELECT 1", &[])
+        let Connected { client, .. } =
+            connect_config_with_password_file(&config, None, &password_file)
                 .await
-                .unwrap()
-                .get::<_, i32>(0),
-            1
-        );
+                .unwrap();
+        assert!(config.get_password().is_none());
+        crate::test_support::assert_connection_usable(&client).await;
     }
 
     #[tokio::test]
@@ -475,7 +479,7 @@ mod tests {
         config.connect_timeout(std::time::Duration::from_millis(500));
         config.ssl_mode(SslMode::Disable);
 
-        let error = match connect_config(&config, None).await {
+        let error = match connect_config_with_interrupt(&config, None).await.unwrap() {
             Ok(_) => panic!("multi-host connection unexpectedly succeeded"),
             Err(error) => error,
         };
@@ -484,7 +488,7 @@ mod tests {
         assert!(is_password_error(error.preferred()));
 
         config.password("definitely-wrong-password");
-        let error = match connect_config(&config, None).await {
+        let error = match connect_config_with_interrupt(&config, None).await.unwrap() {
             Ok(_) => panic!("multi-host connection unexpectedly succeeded"),
             Err(error) => error,
         };
@@ -514,15 +518,7 @@ mod tests {
         let database = connect_configured(config, false, false).await.unwrap();
         assert!(matches!(database.tls, CancellationTls::Disabled));
         assert_eq!(connection_target_count(&database.reconnect_config), 2);
-        assert_eq!(
-            database
-                .client
-                .query_one("SELECT 1", &[])
-                .await
-                .unwrap()
-                .get::<_, i32>(0),
-            1
-        );
+        crate::test_support::assert_connection_usable(&database.client).await;
     }
 
     #[test]
