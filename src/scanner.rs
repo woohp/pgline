@@ -216,6 +216,61 @@ pub fn is_complete(input: &str, standard_conforming_strings: bool) -> bool {
     scan(input, standard_conforming_strings).balanced
 }
 
+/// Splits `sql` into its top-level statements, each as the uppercased words
+/// that appear outside parentheses. Strings, numbers, comments and punctuation
+/// are dropped.
+///
+/// A semicolon inside parentheses or inside a `BEGIN ATOMIC ... END` function
+/// body does not end a statement. Returns `None` when parentheses are
+/// unbalanced, since the statement boundaries cannot be trusted then.
+pub fn statements(sql: &str, standard_conforming_strings: bool) -> Option<Vec<Vec<String>>> {
+    let mut statements = vec![Vec::new()];
+    let mut parenthesis_depth = 0usize;
+    let mut atomic_depth = 0usize;
+    let mut case_depth = 0usize;
+
+    for token in scan(sql, standard_conforming_strings).tokens {
+        let text = &sql[token.start..token.end];
+        match token.kind {
+            TokenKind::Symbol => match text {
+                "(" => parenthesis_depth += 1,
+                ")" => parenthesis_depth = parenthesis_depth.saturating_sub(1),
+                ";" if parenthesis_depth == 0
+                    && atomic_depth == 0
+                    && !statements.last().is_some_and(Vec::is_empty) =>
+                {
+                    statements.push(Vec::new());
+                }
+                _ => {}
+            },
+            TokenKind::Keyword | TokenKind::Word if parenthesis_depth == 0 => {
+                let word = text.to_ascii_uppercase();
+                let statement = statements.last_mut().expect("statement exists");
+                if word == "ATOMIC" && statement.last().is_some_and(|previous| previous == "BEGIN")
+                {
+                    atomic_depth += 1;
+                } else if atomic_depth != 0 {
+                    // Only plain SQL is allowed in a SQL-standard function body,
+                    // so END either closes a CASE or the body itself.
+                    match word.as_str() {
+                        "CASE" => case_depth += 1,
+                        "END" if case_depth != 0 => case_depth -= 1,
+                        "END" => atomic_depth -= 1,
+                        _ => {}
+                    }
+                }
+                statement.push(word);
+            }
+            _ => {}
+        }
+    }
+    if parenthesis_depth != 0 {
+        return None;
+    }
+    statements.retain(|statement| !statement.is_empty());
+    Some(statements)
+}
+
 pub fn word_at(input: &str, cursor: usize) -> (usize, &str) {
     let cursor = floor_char_boundary(input, cursor.min(input.len()));
     let mut start = cursor;
@@ -426,6 +481,25 @@ mod tests {
     fn nested_comments_are_balanced() {
         assert!(is_complete("/* outer /* inner */ done */ select 1;", true));
         assert!(!is_complete("/* unfinished select 1;", true));
+    }
+
+    #[test]
+    fn splits_statements_outside_parentheses_and_atomic_bodies() {
+        let words = |sql: &str| statements(sql, true).unwrap();
+        assert_eq!(
+            words("begin; select 'a;b' /* ; */ from (select 1; 2) t;; commit"),
+            [vec!["BEGIN"], vec!["SELECT", "FROM", "T"], vec!["COMMIT"]]
+        );
+        assert_eq!(
+            words(
+                "CREATE FUNCTION f() RETURNS int LANGUAGE SQL \
+                 BEGIN ATOMIC SELECT CASE WHEN true THEN 1 END; SELECT 2; END; COMMIT"
+            )
+            .len(),
+            2
+        );
+        assert_eq!(statements("select (1", true), None);
+        assert_eq!(statements("", true), Some(Vec::new()));
     }
 
     #[test]

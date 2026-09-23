@@ -23,9 +23,7 @@ pub(crate) fn after_success(
     sql: &str,
     standard_conforming_strings: bool,
 ) -> TransactionStatus {
-    let StatementAnalysis::Known(statements) =
-        top_level_statements(sql, standard_conforming_strings)
-    else {
+    let Some(statements) = scanner::statements(sql, standard_conforming_strings) else {
         return TransactionStatus::Unknown;
     };
     for words in statements {
@@ -40,9 +38,7 @@ pub(crate) fn after_error(
     completed_statements: usize,
     standard_conforming_strings: bool,
 ) -> TransactionStatus {
-    let StatementAnalysis::Known(statements) =
-        top_level_statements(sql, standard_conforming_strings)
-    else {
+    let Some(statements) = scanner::statements(sql, standard_conforming_strings) else {
         return TransactionStatus::Unknown;
     };
     for words in statements.iter().take(completed_statements) {
@@ -100,50 +96,6 @@ fn apply_statement(state: TransactionStatus, words: &[String]) -> TransactionSta
     }
 }
 
-enum StatementAnalysis {
-    Known(Vec<Vec<String>>),
-    Unknown,
-}
-
-fn top_level_statements(sql: &str, standard_conforming_strings: bool) -> StatementAnalysis {
-    let scan = scanner::scan(sql, standard_conforming_strings);
-    let mut statements = vec![Vec::new()];
-    let mut parenthesis_depth = 0usize;
-
-    for token in scan.tokens {
-        let text = &sql[token.start..token.end];
-        if token.kind == scanner::TokenKind::Symbol {
-            match text {
-                "(" => parenthesis_depth += 1,
-                // Extra closing parentheses identify a failed top-level statement.
-                ")" => parenthesis_depth = parenthesis_depth.saturating_sub(1),
-                ";" if parenthesis_depth == 0 && !statements.last().is_some_and(Vec::is_empty) => {
-                    statements.push(Vec::new());
-                }
-                _ => {}
-            }
-        } else if matches!(
-            token.kind,
-            scanner::TokenKind::Keyword | scanner::TokenKind::Word
-        ) {
-            let word = text.to_ascii_uppercase();
-            if word == "ATOMIC"
-                && statements
-                    .last()
-                    .and_then(|statement| statement.last())
-                    .is_some_and(|previous| previous == "BEGIN")
-            {
-                return StatementAnalysis::Unknown;
-            }
-            statements.last_mut().expect("statement exists").push(word);
-        }
-    }
-    if parenthesis_depth != 0 {
-        return StatementAnalysis::Unknown;
-    }
-    statements.retain(|statement| !statement.is_empty());
-    StatementAnalysis::Known(statements)
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,11 +161,20 @@ mod tests {
     }
 
     #[test]
-    fn nested_atomic_sql_is_conservatively_unknown() {
-        let sql = "CREATE FUNCTION f() RETURNS int LANGUAGE SQL BEGIN ATOMIC SELECT 1; END";
+    fn nested_statements_do_not_change_transaction_state() {
+        let function = "CREATE FUNCTION f() RETURNS int LANGUAGE SQL \
+                        BEGIN ATOMIC SELECT CASE WHEN true THEN 1 END; SELECT 2; END";
         assert_eq!(
-            after_success(TransactionStatus::Active, sql, true),
-            TransactionStatus::Unknown
+            after_success(TransactionStatus::Active, function, true),
+            TransactionStatus::Active
+        );
+        assert_eq!(
+            after_success(
+                TransactionStatus::Active,
+                &format!("{function}; COMMIT"),
+                true
+            ),
+            TransactionStatus::Idle
         );
         let rule = "CREATE RULE r AS ON INSERT TO t DO (NOTIFY one; NOTIFY two)";
         assert_eq!(
