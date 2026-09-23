@@ -81,7 +81,7 @@ pub fn stream_writer(
     };
     let (sender, receiver) = mpsc::channel(8);
     let task = tokio::task::spawn_blocking(move || match pager {
-        Some(pager) => write_stream_to_pager(receiver, pager),
+        Some(pager) => write_stream_to_pager(receiver, pager, write_diagnostic),
         None => write_stream(
             receiver,
             |data| {
@@ -98,8 +98,17 @@ pub fn stream_writer(
 
 /// Streams into a pager's stdin, then waits for the pager to exit. Quitting the
 /// pager early closes the pipe and surfaces as [`AppError::PagerClosed`].
-fn write_stream_to_pager(receiver: mpsc::Receiver<StreamOutput>, mut pager: Child) -> Result<()> {
+///
+/// Diagnostics are held until the pager exits: a full-screen pager owns the
+/// terminal while it runs, and writing to stderr underneath it would paint over
+/// its display.
+fn write_stream_to_pager(
+    receiver: mpsc::Receiver<StreamOutput>,
+    mut pager: Child,
+    mut write_diagnostic: impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
     let mut stdin = pager.stdin.take().expect("pager stdin is piped");
+    let mut diagnostics = Vec::new();
     let written = write_stream(
         receiver,
         |data| {
@@ -111,11 +120,17 @@ fn write_stream_to_pager(receiver: mpsc::Receiver<StreamOutput>, mut pager: Chil
                 }
             })
         },
-        write_diagnostic,
+        |diagnostic| {
+            diagnostics.push(diagnostic.to_owned());
+            Ok(())
+        },
     );
     // Closing stdin tells the pager the output is complete.
     drop(stdin);
     let status = pager.wait()?;
+    for diagnostic in &diagnostics {
+        write_diagnostic(diagnostic)?;
+    }
     written?;
     if status.success() {
         Ok(())
@@ -461,14 +476,18 @@ fn page(output: &str) -> Result<()> {
     page_with_command(output, &pager_command())
 }
 
+/// `PGLINE_PAGER` overrides `PAGER`, as `PSQL_PAGER` does for psql, so a
+/// CSV-aware pager can be used here without changing it for every other tool.
 fn pager_command() -> String {
-    env::var("PAGER").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "more".into()
-        } else {
-            "less -SRFX".into()
-        }
-    })
+    env::var("PGLINE_PAGER")
+        .or_else(|_| env::var("PAGER"))
+        .unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "more".into()
+            } else {
+                "less -SRFX".into()
+            }
+        })
 }
 
 fn spawn_pager(pager: &str) -> Result<Child> {
@@ -679,17 +698,54 @@ mod tests {
         };
 
         let pager = spawn_pager("sh -c 'cat >/dev/null'").unwrap();
-        write_stream_to_pager(stream("data".into()), pager).unwrap();
+        write_stream_to_pager(stream("data".into()), pager, write_diagnostic).unwrap();
 
         let pager = spawn_pager("sh -c 'cat >/dev/null; exit 7'").unwrap();
-        let error = write_stream_to_pager(stream("data".into()), pager).unwrap_err();
+        let error =
+            write_stream_to_pager(stream("data".into()), pager, write_diagnostic).unwrap_err();
         assert!(matches!(error, AppError::PagerExit(status) if !status.success()));
 
         // More than a pipe buffer's worth, so the write blocks until the pager
         // exits without reading and the pipe breaks.
         let pager = spawn_pager("sh -c 'exit 0'").unwrap();
-        let error = write_stream_to_pager(stream("x".repeat(1 << 20)), pager).unwrap_err();
+        let error = write_stream_to_pager(stream("x".repeat(1 << 20)), pager, write_diagnostic)
+            .unwrap_err();
         assert!(matches!(error, AppError::PagerClosed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_wait_until_the_pager_has_exited() {
+        let marker = env::temp_dir().join(format!("pgline-pager-exited-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let (sender, receiver) = mpsc::channel(2);
+        sender
+            .blocking_send(StreamOutput::Data("data".into()))
+            .unwrap();
+        sender
+            .blocking_send(StreamOutput::Diagnostic("(1 row)".into()))
+            .unwrap();
+        drop(sender);
+
+        // The pager leaves a marker as it exits, so a diagnostic written before
+        // then would find no marker.
+        let pager = spawn_pager(&format!(
+            "sh -c 'cat >/dev/null; touch {}'",
+            marker.display()
+        ))
+        .unwrap();
+        let mut seen = Vec::new();
+        write_stream_to_pager(receiver, pager, |diagnostic| {
+            assert!(
+                marker.exists(),
+                "diagnostic written while the pager was running"
+            );
+            seen.push(diagnostic.to_owned());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, ["(1 row)"]);
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[cfg(unix)]
