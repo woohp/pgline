@@ -144,20 +144,31 @@ fn write_stream_to_pager(
         }
     }
 
-    // Without a pager, everything held so far is written out, including when
-    // the pager failed to start, so a bad pager setting does not lose output.
     let exited = match child {
         Some(child) => wait_pager(child),
-        None => pending.iter().try_for_each(|output| match output {
-            StreamOutput::Data(data) => write_data(data),
-            StreamOutput::Diagnostic(diagnostic) => write_diagnostic(diagnostic),
-        }),
+        None => {
+            // No pager ever started, so nothing has been shown yet. Write what
+            // was held, and if the pager failed to start, drain the rest unpaged
+            // as well: a display setting must not cancel the query.
+            let flushed = pending.iter().try_for_each(|output| match output {
+                StreamOutput::Data(data) => write_data(data),
+                StreamOutput::Diagnostic(diagnostic) => write_diagnostic(diagnostic),
+            });
+            if written.is_err() {
+                flushed
+                    .and_then(|()| write_stream(receiver, &mut write_data, &mut write_diagnostic))
+            } else {
+                flushed
+            }
+        }
     };
     for diagnostic in &diagnostics {
         write_diagnostic(diagnostic)?;
     }
-    written?;
-    exited
+    // A pager that died is reported by its exit status; one the user quit
+    // shows up only as the broken pipe.
+    exited?;
+    written
 }
 
 /// Hands a newly started pager everything held so far. Held diagnostics move
@@ -790,6 +801,53 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, AppError::PagerClosed));
+
+        // A pager that dies mid-stream also breaks the pipe, but its exit
+        // status is the more useful report.
+        let error = write_stream_to_pager(
+            stream("x".repeat(1 << 20)),
+            "sh -c 'exit 7'",
+            0,
+            write_stdout,
+            write_diagnostic,
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::PagerExit(status) if !status.success()));
+    }
+
+    #[test]
+    fn a_pager_that_cannot_start_falls_back_to_unpaged_output() {
+        let (sender, receiver) = mpsc::channel(3);
+        for output in [
+            StreamOutput::Data("a\n".into()),
+            StreamOutput::Data("b\n".into()),
+            StreamOutput::Diagnostic("(2 rows)".into()),
+        ] {
+            sender.blocking_send(output).unwrap();
+        }
+        drop(sender);
+
+        let seen = std::cell::RefCell::new(Vec::new());
+        let error = write_stream_to_pager(
+            receiver,
+            "'",
+            1,
+            |data| {
+                seen.borrow_mut().push(format!("out:{data}"));
+                Ok(())
+            },
+            |diagnostic| {
+                seen.borrow_mut().push(format!("err:{diagnostic}"));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::InvalidPager));
+        assert_eq!(
+            seen.into_inner(),
+            ["out:a\n", "out:b\n", "err:(2 rows)"],
+            "the whole stream was written despite the pager failing"
+        );
     }
 
     #[cfg(unix)]
