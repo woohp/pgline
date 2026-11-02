@@ -53,11 +53,14 @@ pgline my_database -c 'select 1'
 pgline my_database -f query.sql
 ```
 
-Output to a terminal that is longer than the screen goes through
-`$PGLINE_PAGER`, then `$PAGER`, then `less`; shorter output is printed as is.
+Output to a terminal that is taller or wider than the screen goes through
+`$PGLINE_PAGER`, then `$PAGER`, then `less`; output that fits is printed as is.
+`less` always gets `-S`, so wide rows are chopped and scroll sideways instead of
+wrapping (`less -+S` turns that off), and `$LESS` defaults to `-FX`.
 Output to a pipe or file is never paged. CSV and TSV rows stream into the pager
 as they arrive; table and vertical output is written once each statement
-completes. Quitting the pager cancels the query. A CSV-aware pager works well
+completes. At the REPL, CSV and TSV results always go through the pager, even
+when short. Quitting the pager cancels the query. A CSV-aware pager works well
 with `--format csv`:
 
 ```sh
