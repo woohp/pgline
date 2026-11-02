@@ -93,21 +93,26 @@ pub fn stream_writer(
             Paging::WhenOverflowing => Screen::current(),
             Paging::Always => Screen::NOTHING_FITS,
         };
-        warn_on_pager_failure(write_stream_to_pager(
+        match write_stream_to_pager(
             receiver,
             &pager_command(),
             screen,
             write_stdout,
             write_diagnostic,
-        ))
+        ) {
+            // A pager that failed after starting may have dropped rows that
+            // cannot be replayed, so that stays an error. One that never
+            // started had every row written unpaged.
+            Err(error @ AppError::PagerExit(_)) => Err(error),
+            result => warn_on_pager_failure(result),
+        }
     });
     (sender, task)
 }
 
-/// A pager that cannot start, or that fails, is a display problem rather than
-/// a failed query: the output was written unpaged, or the pager showed what it
-/// could. So report it and carry on instead of ending the command or the REPL
-/// session.
+/// A pager that failed, once its output has been written unpaged instead, is a
+/// display problem rather than a failed query. So report it and carry on
+/// instead of ending the command or the REPL session.
 fn warn_on_pager_failure(result: Result<()>) -> Result<()> {
     match result {
         Err(

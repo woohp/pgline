@@ -410,6 +410,21 @@ impl App {
                 return Ok(());
             }
             Err(AppError::PagerClosed) if mode == Mode::Repl => {}
+            // A pager that failed mid-stream may have dropped rows, which is
+            // worth a warning at the REPL but not the end of the session.
+            Err(error @ AppError::PagerExit(_)) if mode == Mode::Repl => {
+                eprintln!(
+                    "warning: {}",
+                    output::safe_terminal_text(&error.to_string())
+                );
+                if execution
+                    .error
+                    .as_ref()
+                    .is_none_or(executor::is_query_cancelled)
+                {
+                    return Ok(());
+                }
+            }
             Err(error) => return Err(error),
         }
         self.present_execution(&execution, query_started.elapsed())?;
