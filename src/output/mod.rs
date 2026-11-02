@@ -108,7 +108,7 @@ pub fn stream_writer(
 /// on `screen`. Output that fits, such as a row count or a few narrow rows, is
 /// written through `write_data` and `write_diagnostic` in its original order
 /// at the end instead, so a pager never opens on something that fits on the
-/// screen. Quitting the pager early closes the pipe and surfaces as
+/// screen, unless that is [`Screen::NOTHING_FITS`]. Quitting the pager early closes the pipe and surfaces as
 /// [`AppError::PagerClosed`].
 ///
 /// Once a pager is running, diagnostics are held until it exits: a full-screen
@@ -571,14 +571,15 @@ impl Screen {
     }
 
     fn too_narrow_for(self, output: &str) -> bool {
+        // A tab, as TSV writes them, advances up to 8 columns rather than 1.
         output
             .lines()
-            .any(|line| get_line_width(line) > self.columns)
+            .any(|line| get_line_width(line) + 7 * line.matches('\t').count() > self.columns)
     }
 }
 
 fn page(output: &str) -> Result<()> {
-    page_with_command(output, &pager_command())
+    page_with_command(output, &pager_command(), write_stdout)
 }
 
 /// `PGLINE_PAGER` overrides `PAGER`, as `PSQL_PAGER` does for psql, so a
@@ -608,8 +609,21 @@ fn spawn_pager(pager: &str) -> Result<Child> {
         .spawn()?)
 }
 
-fn page_with_command(output: &str, pager: &str) -> Result<()> {
-    let mut child = spawn_pager(pager)?;
+/// Pages `output`, or writes it through `write_data` if the pager cannot start:
+/// a display setting must not lose the result. The start failure is still
+/// reported.
+fn page_with_command(
+    output: &str,
+    pager: &str,
+    write_data: impl FnOnce(&str) -> Result<()>,
+) -> Result<()> {
+    let mut child = match spawn_pager(pager) {
+        Ok(child) => child,
+        Err(error) => {
+            write_data(output)?;
+            return Err(error);
+        }
+    };
     if let Some(stdin) = child.stdin.as_mut()
         && let Err(error) = stdin.write_all(output.as_bytes())
         && error.kind() != io::ErrorKind::BrokenPipe
@@ -987,6 +1001,18 @@ mod tests {
     }
 
     #[test]
+    fn buffered_output_is_written_when_the_pager_cannot_start() {
+        let mut seen = None;
+        let error = page_with_command("output", "'", |data| {
+            seen = Some(data.to_owned());
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(error, AppError::InvalidPager));
+        assert_eq!(seen.as_deref(), Some("output"));
+    }
+
+    #[test]
     fn width_is_measured_in_terminal_columns() {
         let screen = Screen {
             lines: 24,
@@ -994,6 +1020,7 @@ mod tests {
         };
         assert!(!screen.too_narrow_for("ab\n日本\n"));
         assert!(screen.too_narrow_for("ab\n日本語\n"));
+        assert!(screen.too_narrow_for("a\tb\n"));
     }
 
     #[cfg(unix)]
@@ -1004,7 +1031,7 @@ mod tests {
         std::fs::write(&less, "#!/bin/sh\ncat >/dev/null\n[ \"$*\" = '-S -R' ]\n").unwrap();
         std::fs::set_permissions(&less, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .unwrap();
-        page_with_command("output", &format!("{} -R", less.display())).unwrap();
+        page_with_command("output", &format!("{} -R", less.display()), write_stdout).unwrap();
     }
 
     #[cfg(unix)]
@@ -1047,7 +1074,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pager_nonzero_exit_is_reported() {
-        let error = page_with_command("output", "sh -c 'cat >/dev/null; exit 7'").unwrap_err();
+        let error = page_with_command("output", "sh -c 'cat >/dev/null; exit 7'", |_| {
+            panic!("output written outside a pager that started")
+        })
+        .unwrap_err();
         assert!(matches!(error, AppError::PagerExit(status) if !status.success()));
     }
 
