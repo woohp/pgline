@@ -46,6 +46,12 @@ pub enum AppError {
     #[error("pager command is empty or invalid")]
     InvalidPager,
 
+    #[error("could not start pager {pager}: {source}")]
+    PagerStart {
+        pager: String,
+        source: std::io::Error,
+    },
+
     #[error("{0}")]
     InvalidCommand(String),
 }

@@ -93,15 +93,28 @@ pub fn stream_writer(
             Paging::WhenOverflowing => Screen::current(),
             Paging::Always => Screen::NOTHING_FITS,
         };
-        write_stream_to_pager(
+        warn_on_pager_failure(write_stream_to_pager(
             receiver,
             &pager_command(),
             screen,
             write_stdout,
             write_diagnostic,
-        )
+        ))
     });
     (sender, task)
+}
+
+/// A pager that cannot start, or that fails, is a display problem rather than
+/// a failed query: the output was written unpaged, or the pager showed what it
+/// could. So report it and carry on instead of ending the command or the REPL
+/// session.
+fn warn_on_pager_failure(result: Result<()>) -> Result<()> {
+    match result {
+        Err(
+            error @ (AppError::InvalidPager | AppError::PagerStart { .. } | AppError::PagerExit(_)),
+        ) => write_diagnostic(&safe_terminal_text(&error.to_string())),
+        result => result,
+    }
 }
 
 /// Streams into a pager, which is started only once the output no longer fits
@@ -513,7 +526,7 @@ fn display_value(value: &Option<String>) -> &str {
 
 pub fn write(output: &str, pager_enabled: bool) -> Result<()> {
     if pager_enabled && io::stdout().is_terminal() && should_page(output) {
-        return page(output);
+        return warn_on_pager_failure(page(output));
     }
     write_stdout(output)
 }
@@ -602,11 +615,15 @@ fn spawn_pager(pager: &str) -> Result<Child> {
         // can still turn it off with -+S.
         command.arg("-S");
     }
-    Ok(command
+    command
         .args(parts)
         .env("LESS", env::var("LESS").unwrap_or_else(|_| "-FX".into()))
         .stdin(Stdio::piped())
-        .spawn()?)
+        .spawn()
+        .map_err(|source| AppError::PagerStart {
+            pager: program,
+            source,
+        })
 }
 
 /// Pages `output`, or writes it through `write_data` if the pager cannot start:
@@ -998,6 +1015,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, AppError::PagerExit(_)));
+    }
+
+    #[test]
+    fn pager_failures_are_warnings_but_quitting_the_pager_is_not() {
+        warn_on_pager_failure(Err(AppError::InvalidPager)).unwrap();
+        let quit = warn_on_pager_failure(Err(AppError::PagerClosed)).unwrap_err();
+        assert!(matches!(quit, AppError::PagerClosed));
     }
 
     #[test]
