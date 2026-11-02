@@ -60,9 +60,9 @@ pub struct Cli {
     #[arg(long)]
     pub row_limit: Option<usize>,
 
-    /// Maximum characters shown per field; 0 means unlimited. Defaults to 500 for table and vertical output at the REPL and unlimited otherwise
-    #[arg(long)]
-    pub max_field_width: Option<usize>,
+    /// Maximum characters shown per field; 0, the default, means unlimited
+    #[arg(long, default_value_t = 0)]
+    pub max_field_width: usize,
 
     #[arg(short = 'x', long)]
     pub expanded: bool,
@@ -108,11 +108,11 @@ mod tests {
     fn limits_are_opt_in_at_the_cli_layer() {
         let defaults = Cli::try_parse_from(["pgline"]).unwrap();
         assert_eq!(defaults.row_limit, None);
-        assert_eq!(defaults.max_field_width, None);
+        assert_eq!(defaults.max_field_width, 0);
         let explicit =
             Cli::try_parse_from(["pgline", "--row-limit", "7", "--max-field-width", "42"]).unwrap();
         assert_eq!(explicit.row_limit, Some(7));
-        assert_eq!(explicit.max_field_width, Some(42));
+        assert_eq!(explicit.max_field_width, 42);
     }
 
     #[test]
