@@ -67,28 +67,39 @@ pub enum StreamOutput {
     Diagnostic(String),
 }
 
-/// Starts a blocking writer thread that copies streamed data to stdout, or
-/// into the pager when `page` is set, and diagnostics to stderr. Dropping the
-/// sender ends the thread; await the handle to collect any write error.
+/// When streamed data goes through the pager.
+#[derive(Clone, Copy)]
+pub enum Paging {
+    Off,
+    /// Once the output no longer fits on the screen.
+    WhenOverflowing,
+    /// As soon as there is any data.
+    Always,
+}
+
+/// Starts a blocking writer thread that copies streamed data to stdout or into
+/// the pager, as `paging` says, and diagnostics to stderr. Dropping the sender
+/// ends the thread; await the handle to collect any write error.
 pub fn stream_writer(
-    page: bool,
+    paging: Paging,
 ) -> (
     mpsc::Sender<StreamOutput>,
     tokio::task::JoinHandle<Result<()>>,
 ) {
     let (sender, receiver) = mpsc::channel(8);
     let task = tokio::task::spawn_blocking(move || {
-        if page {
-            write_stream_to_pager(
-                receiver,
-                &pager_command(),
-                Screen::current(),
-                write_stdout,
-                write_diagnostic,
-            )
-        } else {
-            write_stream(receiver, write_stdout, write_diagnostic)
-        }
+        let screen = match paging {
+            Paging::Off => return write_stream(receiver, write_stdout, write_diagnostic),
+            Paging::WhenOverflowing => Screen::current(),
+            Paging::Always => Screen::NOTHING_FITS,
+        };
+        write_stream_to_pager(
+            receiver,
+            &pager_command(),
+            screen,
+            write_stdout,
+            write_diagnostic,
+        )
     });
     (sender, task)
 }
@@ -542,6 +553,11 @@ struct Screen {
 }
 
 impl Screen {
+    const NOTHING_FITS: Self = Self {
+        lines: 0,
+        columns: 0,
+    };
+
     /// A terminal that reports no size is treated as a standard 80x24 one.
     fn current() -> Self {
         let (columns, height) = crossterm::terminal::size()
@@ -805,7 +821,7 @@ mod tests {
         write_stream_to_pager(
             stream("data".into()),
             "sh -c 'cat >/dev/null'",
-            tall(0),
+            Screen::NOTHING_FITS,
             write_stdout,
             write_diagnostic,
         )
@@ -814,7 +830,7 @@ mod tests {
         let error = write_stream_to_pager(
             stream("data".into()),
             "sh -c 'cat >/dev/null; exit 7'",
-            tall(0),
+            Screen::NOTHING_FITS,
             write_stdout,
             write_diagnostic,
         )
@@ -826,7 +842,7 @@ mod tests {
         let error = write_stream_to_pager(
             stream("x".repeat(1 << 20)),
             "sh -c 'exit 0'",
-            tall(0),
+            Screen::NOTHING_FITS,
             write_stdout,
             write_diagnostic,
         )
@@ -838,7 +854,7 @@ mod tests {
         let error = write_stream_to_pager(
             stream("x".repeat(1 << 20)),
             "sh -c 'exit 7'",
-            tall(0),
+            Screen::NOTHING_FITS,
             write_stdout,
             write_diagnostic,
         )
@@ -1009,14 +1025,20 @@ mod tests {
         // then would find no marker.
         let pager = format!("sh -c 'cat >/dev/null; touch {}'", marker.display());
         let mut seen = Vec::new();
-        write_stream_to_pager(receiver, &pager, tall(0), write_stdout, |diagnostic| {
-            assert!(
-                marker.exists(),
-                "diagnostic written while the pager was running"
-            );
-            seen.push(diagnostic.to_owned());
-            Ok(())
-        })
+        write_stream_to_pager(
+            receiver,
+            &pager,
+            Screen::NOTHING_FITS,
+            write_stdout,
+            |diagnostic| {
+                assert!(
+                    marker.exists(),
+                    "diagnostic written while the pager was running"
+                );
+                seen.push(diagnostic.to_owned());
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(seen, ["(1 row)"]);
         let _ = std::fs::remove_file(&marker);

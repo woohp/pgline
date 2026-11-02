@@ -443,8 +443,17 @@ impl App {
         let (output_sink, writer) = if mode == Mode::Repl && !layout.is_machine_readable() {
             (None, None)
         } else {
-            let page = self.pager && io::stdout().is_terminal();
-            let (sink, writer) = output::stream_writer(page);
+            let paging = if !self.pager || !io::stdout().is_terminal() {
+                output::Paging::Off
+            } else if mode == Mode::Repl {
+                // Only CSV and TSV stream at the REPL. They are paged even when
+                // short, as pgcli does, so a CSV viewer such as csvlens shows
+                // every result rather than only the long ones.
+                output::Paging::Always
+            } else {
+                output::Paging::WhenOverflowing
+            };
+            let (sink, writer) = output::stream_writer(paging);
             (Some(sink), Some(writer))
         };
         let execution = executor::execute(
