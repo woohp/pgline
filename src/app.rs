@@ -47,7 +47,6 @@ pub enum Mode {
 /// Limits applied at the REPL unless overridden, so an accidental `SELECT *`
 /// at the prompt stays survivable. Scripts get complete output.
 const REPL_ROW_LIMIT: usize = 1000;
-const REPL_MAX_FIELD_WIDTH: usize = 500;
 const METADATA_LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 const CATALOG_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -232,11 +231,7 @@ impl App {
             command,
             commands::catalog::CatalogLimits {
                 row_limit: effective_row_limit(mode, self.cli.row_limit),
-                max_field_width: effective_max_field_width(
-                    mode,
-                    Layout::Table,
-                    self.cli.max_field_width,
-                ),
+                max_field_width: self.cli.max_field_width,
             },
         );
         let outcome = executor::await_cancellable_query(
@@ -464,7 +459,7 @@ impl App {
                 format: self.cli.format,
                 expanded: self.expanded,
                 row_limit: effective_row_limit(mode, self.cli.row_limit),
-                max_field_width: effective_max_field_width(mode, layout, self.cli.max_field_width),
+                max_field_width: self.cli.max_field_width,
             },
             output_sink.as_ref(),
         )
@@ -555,16 +550,6 @@ fn effective_row_limit(mode: Mode, configured: Option<usize>) -> usize {
     })
 }
 
-/// Only human output at the REPL truncates fields by default. Scripts and
-/// machine-readable output keep whole fields unless a width was asked for.
-fn effective_max_field_width(mode: Mode, layout: Layout, configured: Option<usize>) -> usize {
-    configured.unwrap_or(if mode == Mode::Repl && !layout.is_machine_readable() {
-        REPL_MAX_FIELD_WIDTH
-    } else {
-        0
-    })
-}
-
 fn on_off(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
@@ -580,12 +565,8 @@ fn format_duration(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        cli::OutputFormat,
-        test_support::{
-            assert_connection_usable, backend_pid, connect, connect_with_cli,
-            wait_until_query_active,
-        },
+    use crate::test_support::{
+        assert_connection_usable, backend_pid, connect, connect_with_cli, wait_until_query_active,
     };
 
     #[tokio::test]
@@ -892,27 +873,10 @@ mod tests {
     }
 
     #[test]
-    fn default_limits_apply_only_at_the_repl() {
-        let csv = Layout::new(OutputFormat::Csv, false);
-        let expanded_csv = Layout::new(OutputFormat::Csv, true);
-        let table = Layout::new(OutputFormat::Table, false);
-
+    fn default_row_limit_applies_only_at_the_repl() {
         assert_eq!(effective_row_limit(Mode::Repl, None), 1000);
         assert_eq!(effective_row_limit(Mode::OneShot, None), 0);
         assert_eq!(effective_row_limit(Mode::OneShot, Some(7)), 7);
-
-        assert_eq!(effective_max_field_width(Mode::Repl, csv, None), 0);
-        assert_eq!(
-            effective_max_field_width(Mode::Repl, expanded_csv, None),
-            500
-        );
-        assert_eq!(effective_max_field_width(Mode::Repl, table, None), 500);
-        assert_eq!(effective_max_field_width(Mode::OneShot, table, None), 0);
-        assert_eq!(effective_max_field_width(Mode::Repl, csv, Some(12)), 12);
-        assert_eq!(
-            effective_max_field_width(Mode::OneShot, table, Some(12)),
-            12
-        );
     }
 
     #[test]
