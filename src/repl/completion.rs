@@ -147,10 +147,14 @@ impl SqlCompleter {
                     .cloned()
                     .map(|value| (value, Some("relation".into()))),
             );
+            // Like psql and pgcli, hide system (mostly temporary) schemas
+            // unless the user has started typing one.
+            let show_system_schemas = line[word_start..].to_ascii_lowercase().starts_with("pg_");
             values.extend(
                 metadata
                     .schemas
                     .iter()
+                    .filter(|schema| show_system_schemas || !schema.starts_with("pg_"))
                     .cloned()
                     .map(|value| (value, Some("schema".into()))),
             );
@@ -182,21 +186,23 @@ fn qualified_relations(
     if !matches!(schema_token.kind, TokenKind::Word | TokenKind::Keyword) {
         return None;
     }
-    let previous = scan.tokens[..scan.tokens.len() - 1]
-        .iter()
-        .rev()
-        .find(|token| token.kind != TokenKind::Comment)?;
-    if !is_relation_context(
-        before_dot[previous.start..previous.end]
-            .to_ascii_uppercase()
-            .as_str(),
-    ) {
-        return None;
+    if !is_describe_argument_completion(before_dot) {
+        let previous = scan.tokens[..scan.tokens.len() - 1]
+            .iter()
+            .rev()
+            .find(|token| token.kind != TokenKind::Comment)?;
+        if !is_relation_context(
+            before_dot[previous.start..previous.end]
+                .to_ascii_uppercase()
+                .as_str(),
+        ) {
+            return None;
+        }
     }
     let schema = identifier_value(&before_dot[schema_token.start..schema_token.end])?;
     Some(
         metadata
-            .relations
+            .qualified_relations
             .iter()
             .filter_map(|relation| {
                 let components = identifier_components(relation)?;
@@ -359,7 +365,7 @@ impl SqlCompleter {
             completion_start(line, pos, standard_conforming_strings)
         };
         let prefix_lower = line[start..pos].to_ascii_lowercase();
-        self.candidates(line, start)
+        self.candidates(typed, start)
             .into_iter()
             .filter(|(value, _)| {
                 !value.chars().any(output::is_unsafe_terminal_character)
@@ -388,8 +394,9 @@ mod tests {
 
     fn test_metadata() -> Metadata {
         Metadata {
-            schemas: vec!["public".into()],
-            relations: vec!["users".into(), "public.users".into()],
+            schemas: vec!["public".into(), "other".into(), "pg_temp_3".into()],
+            relations: vec!["users".into(), "other.hidden".into()],
+            qualified_relations: vec!["public.users".into(), "other.hidden".into()],
             columns: vec!["id".into(), "name".into()],
             relation_columns: HashMap::from([("users".into(), vec!["id".into(), "name".into()])]),
             truncated: false,
@@ -447,7 +454,7 @@ mod tests {
         assert_eq!(values, ["users"]);
 
         let metadata = Metadata {
-            relations: vec!["\"odd.schema\".\"Order.Items\"".into()],
+            qualified_relations: vec!["\"odd.schema\".\"Order.Items\"".into()],
             ..Metadata::default()
         };
         let line = "select * from \"odd.schema\".Ord";
@@ -568,6 +575,38 @@ mod tests {
             .map(|suggestion| suggestion.value)
             .collect();
         assert_eq!(values, ["users"]);
+    }
+
+    #[test]
+    fn empty_relation_prefix_lists_each_relation_once_without_system_schemas() {
+        for line in ["\\d ", "select * from "] {
+            let values: Vec<_> = completer()
+                .suggestions(line, line.len())
+                .into_iter()
+                .map(|suggestion| suggestion.value)
+                .collect();
+            assert_eq!(values, ["other", "other.hidden", "public", "users"]);
+        }
+
+        let line = "\\d pg_";
+        let values: Vec<_> = completer()
+            .suggestions(line, line.len())
+            .into_iter()
+            .map(|suggestion| suggestion.value)
+            .collect();
+        assert_eq!(values, ["pg_temp_3"]);
+    }
+
+    #[test]
+    fn suggests_schema_qualified_describe_arguments() {
+        for (line, expected) in [("\\d public.", "users"), ("\\d+ other.h", "hidden")] {
+            let values: Vec<_> = completer()
+                .suggestions(line, line.len())
+                .into_iter()
+                .map(|suggestion| suggestion.value)
+                .collect();
+            assert_eq!(values, [expected]);
+        }
     }
 
     #[test]
