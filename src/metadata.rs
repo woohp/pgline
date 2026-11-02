@@ -25,7 +25,11 @@ const METADATA_LIMITS: MetadataLimits = MetadataLimits {
 #[derive(Debug, Clone, Default)]
 pub struct Metadata {
     pub schemas: Vec<String>,
+    /// Each relation once: unqualified when visible on the search path,
+    /// schema-qualified otherwise.
     pub relations: Vec<String>,
+    /// Every relation, schema-qualified.
+    pub qualified_relations: Vec<String>,
     pub columns: Vec<String>,
     pub relation_columns: HashMap<String, Vec<String>>,
     pub truncated: bool,
@@ -79,6 +83,7 @@ impl Metadata {
         .await?;
 
         let mut relations = BTreeSet::new();
+        let mut qualified_relations = BTreeSet::new();
         let mut relation_columns: HashMap<String, Vec<String>> = HashMap::new();
         let mut relation_names = HashMap::new();
         let mut relation_oids = Vec::new();
@@ -104,8 +109,10 @@ impl Metadata {
                 if let Some(relation) = &unqualified_relation {
                     relations.insert(relation.clone());
                     relation_columns.entry(relation.clone()).or_default();
+                } else {
+                    relations.insert(qualified_relation.clone());
                 }
-                relations.insert(qualified_relation.clone());
+                qualified_relations.insert(qualified_relation.clone());
                 relation_columns
                     .entry(qualified_relation.clone())
                     .or_default();
@@ -153,6 +160,7 @@ impl Metadata {
         Ok(Self {
             schemas,
             relations: relations.into_iter().collect(),
+            qualified_relations: qualified_relations.into_iter().collect(),
             columns: columns.into_iter().collect(),
             relation_columns,
             truncated,
@@ -189,6 +197,7 @@ const SCHEMA_QUERY: &str = r#"
     FROM pg_catalog.pg_namespace n
     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
       AND n.nspname !~ '^pg_toast'
+      AND NOT pg_catalog.pg_is_other_temp_schema(n.oid)
     ORDER BY n.nspname = ANY(pg_catalog.current_schemas(false)) DESC,
              n.nspname
     LIMIT $1
@@ -203,6 +212,7 @@ const RELATION_QUERY: &str = r#"
     WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
       AND n.nspname !~ '^pg_toast'
+      AND NOT pg_catalog.pg_is_other_temp_schema(n.oid)
     ORDER BY pg_catalog.pg_table_is_visible(c.oid) DESC,
              n.nspname, c.relname
     LIMIT $1
@@ -314,9 +324,11 @@ mod tests {
         );
         assert!(metadata.schemas.contains(&"\"Empty.Schema\"".into()));
         assert!(metadata.relations.contains(&"empty".into()));
+        assert!(metadata.relations.contains(&"pi_hidden_b.users".into()));
+        assert!(!metadata.relations.contains(&"pi_visible_a.users".into()));
         assert!(
             metadata
-                .relations
+                .qualified_relations
                 .contains(&"pi_visible_a.\"Order.Items\"".into())
         );
         assert_eq!(
