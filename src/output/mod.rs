@@ -112,7 +112,10 @@ fn warn_on_pager_failure(result: Result<()>) -> Result<()> {
     match result {
         Err(
             error @ (AppError::InvalidPager | AppError::PagerStart { .. } | AppError::PagerExit(_)),
-        ) => write_diagnostic(&safe_terminal_text(&error.to_string())),
+        ) => write_diagnostic(&format!(
+            "warning: {}",
+            safe_terminal_text(&error.to_string())
+        )),
         result => result,
     }
 }
