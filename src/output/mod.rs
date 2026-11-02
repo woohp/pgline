@@ -629,9 +629,11 @@ fn spawn_pager(pager: &str) -> Result<Child> {
         })
 }
 
-/// Pages `output`, or writes it through `write_data` if the pager cannot start:
-/// a display setting must not lose the result. The start failure is still
-/// reported.
+/// Pages `output`, or writes it through `write_data` if the pager cannot start
+/// or exits unsuccessfully: a display setting must not lose the result. The
+/// failure is still reported. A pager that fails may never have shown the
+/// output, as with a bad option, and nothing tells that apart from one that
+/// failed after showing it, so showing it twice is the safe side.
 fn page_with_command(
     output: &str,
     pager: &str,
@@ -650,7 +652,13 @@ fn page_with_command(
     {
         return Err(error.into());
     }
-    wait_pager(child)
+    match wait_pager(child) {
+        Err(error @ AppError::PagerExit(_)) => {
+            write_data(output)?;
+            Err(error)
+        }
+        result => result,
+    }
 }
 
 /// Closes the pager's stdin, which tells it the output is complete, and waits
@@ -1100,12 +1108,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pager_nonzero_exit_is_reported() {
-        let error = page_with_command("output", "sh -c 'cat >/dev/null; exit 7'", |_| {
-            panic!("output written outside a pager that started")
+    fn a_failing_pager_is_reported_and_its_output_written() {
+        // Exits without reading, as a pager given a bad option does.
+        let mut seen = None;
+        let error = page_with_command("output", "sh -c 'exit 7'", |data| {
+            seen = Some(data.to_owned());
+            Ok(())
         })
         .unwrap_err();
         assert!(matches!(error, AppError::PagerExit(status) if !status.success()));
+        assert_eq!(seen.as_deref(), Some("output"));
     }
 
     #[test]
