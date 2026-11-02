@@ -93,15 +93,36 @@ pub fn stream_writer(
             Paging::WhenOverflowing => Screen::current(),
             Paging::Always => Screen::NOTHING_FITS,
         };
-        write_stream_to_pager(
+        match write_stream_to_pager(
             receiver,
             &pager_command(),
             screen,
             write_stdout,
             write_diagnostic,
-        )
+        ) {
+            // A pager that failed after starting may have dropped rows that
+            // cannot be replayed, so that stays an error. One that never
+            // started had every row written unpaged.
+            Err(error @ AppError::PagerExit(_)) => Err(error),
+            result => warn_on_pager_failure(result),
+        }
     });
     (sender, task)
+}
+
+/// A pager that failed, once its output has been written unpaged instead, is a
+/// display problem rather than a failed query. So report it and carry on
+/// instead of ending the command or the REPL session.
+fn warn_on_pager_failure(result: Result<()>) -> Result<()> {
+    match result {
+        Err(
+            error @ (AppError::InvalidPager | AppError::PagerStart { .. } | AppError::PagerExit(_)),
+        ) => write_diagnostic(&format!(
+            "warning: {}",
+            safe_terminal_text(&error.to_string())
+        )),
+        result => result,
+    }
 }
 
 /// Streams into a pager, which is started only once the output no longer fits
@@ -513,7 +534,7 @@ fn display_value(value: &Option<String>) -> &str {
 
 pub fn write(output: &str, pager_enabled: bool) -> Result<()> {
     if pager_enabled && io::stdout().is_terminal() && should_page(output) {
-        return page(output);
+        return warn_on_pager_failure(page(output));
     }
     write_stdout(output)
 }
@@ -602,16 +623,22 @@ fn spawn_pager(pager: &str) -> Result<Child> {
         // can still turn it off with -+S.
         command.arg("-S");
     }
-    Ok(command
+    command
         .args(parts)
         .env("LESS", env::var("LESS").unwrap_or_else(|_| "-FX".into()))
         .stdin(Stdio::piped())
-        .spawn()?)
+        .spawn()
+        .map_err(|source| AppError::PagerStart {
+            pager: program,
+            source,
+        })
 }
 
-/// Pages `output`, or writes it through `write_data` if the pager cannot start:
-/// a display setting must not lose the result. The start failure is still
-/// reported.
+/// Pages `output`, or writes it through `write_data` if the pager cannot start
+/// or exits unsuccessfully: a display setting must not lose the result. The
+/// failure is still reported. A pager that fails may never have shown the
+/// output, as with a bad option, and nothing tells that apart from one that
+/// failed after showing it, so showing it twice is the safe side.
 fn page_with_command(
     output: &str,
     pager: &str,
@@ -630,7 +657,13 @@ fn page_with_command(
     {
         return Err(error.into());
     }
-    wait_pager(child)
+    match wait_pager(child) {
+        Err(error @ AppError::PagerExit(_)) => {
+            write_data(output)?;
+            Err(error)
+        }
+        result => result,
+    }
 }
 
 /// Closes the pager's stdin, which tells it the output is complete, and waits
@@ -1001,6 +1034,13 @@ mod tests {
     }
 
     #[test]
+    fn pager_failures_are_warnings_but_quitting_the_pager_is_not() {
+        warn_on_pager_failure(Err(AppError::InvalidPager)).unwrap();
+        let quit = warn_on_pager_failure(Err(AppError::PagerClosed)).unwrap_err();
+        assert!(matches!(quit, AppError::PagerClosed));
+    }
+
+    #[test]
     fn buffered_output_is_written_when_the_pager_cannot_start() {
         let mut seen = None;
         let error = page_with_command("output", "'", |data| {
@@ -1073,12 +1113,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn pager_nonzero_exit_is_reported() {
-        let error = page_with_command("output", "sh -c 'cat >/dev/null; exit 7'", |_| {
-            panic!("output written outside a pager that started")
+    fn a_failing_pager_is_reported_and_its_output_written() {
+        // Exits without reading, as a pager given a bad option does.
+        let mut seen = None;
+        let error = page_with_command("output", "sh -c 'exit 7'", |data| {
+            seen = Some(data.to_owned());
+            Ok(())
         })
         .unwrap_err();
         assert!(matches!(error, AppError::PagerExit(status) if !status.success()));
+        assert_eq!(seen.as_deref(), Some("output"));
     }
 
     #[test]
