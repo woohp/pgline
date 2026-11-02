@@ -1,10 +1,12 @@
 use std::{
     env,
+    ffi::OsStr,
     io::{self, IsTerminal, Write},
+    path::Path,
     process::{Child, Command, Stdio},
 };
 
-use tabled::{builder::Builder, settings::Style};
+use tabled::{builder::Builder, grid::util::string::get_line_width, settings::Style};
 use tokio::sync::mpsc;
 
 use crate::{
@@ -80,7 +82,7 @@ pub fn stream_writer(
             write_stream_to_pager(
                 receiver,
                 &pager_command(),
-                screen_lines(),
+                Screen::current(),
                 write_stdout,
                 write_diagnostic,
             )
@@ -91,8 +93,8 @@ pub fn stream_writer(
     (sender, task)
 }
 
-/// Streams into a pager, which is started only once the output reaches
-/// `page_after_lines`. Shorter output, such as a row count or a few rows, is
+/// Streams into a pager, which is started only once the output no longer fits
+/// on `screen`. Output that fits, such as a row count or a few narrow rows, is
 /// written through `write_data` and `write_diagnostic` in its original order
 /// at the end instead, so a pager never opens on something that fits on the
 /// screen. Quitting the pager early closes the pipe and surfaces as
@@ -104,7 +106,7 @@ pub fn stream_writer(
 fn write_stream_to_pager(
     mut receiver: mpsc::Receiver<StreamOutput>,
     pager: &str,
-    page_after_lines: usize,
+    screen: Screen,
     mut write_data: impl FnMut(&str) -> Result<()>,
     mut write_diagnostic: impl FnMut(&str) -> Result<()>,
 ) -> Result<()> {
@@ -120,8 +122,9 @@ fn write_stream_to_pager(
             (StreamOutput::Data(data), Some(child)) => write_to_pager(child, &data),
             (StreamOutput::Data(data), None) => {
                 pending_lines += data.matches('\n').count();
+                let too_wide = screen.too_narrow_for(&data);
                 pending.push(StreamOutput::Data(data));
-                if pending_lines >= page_after_lines {
+                if too_wide || pending_lines >= screen.lines {
                     spawn_pager(pager).and_then(|started| {
                         flush_to_pager(child.insert(started), &mut pending, &mut diagnostics)
                     })
@@ -525,18 +528,37 @@ fn stdout_error(error: io::Error) -> AppError {
 }
 
 fn should_page(output: &str) -> bool {
-    output.lines().count() >= screen_lines()
+    let screen = Screen::current();
+    output.lines().count() >= screen.lines || screen.too_narrow_for(output)
 }
 
-/// How many lines of output fit on the terminal before paging is worthwhile.
-/// A terminal that reports no height is treated as a standard 24-line one.
-fn screen_lines() -> usize {
-    crossterm::terminal::size()
-        .ok()
-        .map(|(_, height)| height as usize)
-        .filter(|height| *height > 0)
-        .unwrap_or(24)
-        .saturating_sub(2)
+/// How much output fits on the terminal before paging is worthwhile. Output
+/// wider than the terminal is paged however short it is: wrapped table rows
+/// are unreadable, and a pager can show them unwrapped.
+#[derive(Clone, Copy)]
+struct Screen {
+    lines: usize,
+    columns: usize,
+}
+
+impl Screen {
+    /// A terminal that reports no size is treated as a standard 80x24 one.
+    fn current() -> Self {
+        let (columns, height) = crossterm::terminal::size()
+            .ok()
+            .filter(|(columns, height)| *columns > 0 && *height > 0)
+            .unwrap_or((80, 24));
+        Self {
+            lines: usize::from(height).saturating_sub(2),
+            columns: usize::from(columns),
+        }
+    }
+
+    fn too_narrow_for(self, output: &str) -> bool {
+        output
+            .lines()
+            .any(|line| get_line_width(line) > self.columns)
+    }
 }
 
 fn page(output: &str) -> Result<()> {
@@ -548,13 +570,7 @@ fn page(output: &str) -> Result<()> {
 fn pager_command() -> String {
     env::var("PGLINE_PAGER")
         .or_else(|_| env::var("PAGER"))
-        .unwrap_or_else(|_| {
-            if cfg!(windows) {
-                "more".into()
-            } else {
-                "less -SRFX".into()
-            }
-        })
+        .unwrap_or_else(|_| "less".into())
 }
 
 fn spawn_pager(pager: &str) -> Result<Child> {
@@ -562,9 +578,16 @@ fn spawn_pager(pager: &str) -> Result<Child> {
         .ok_or(AppError::InvalidPager)?
         .into_iter();
     let program = parts.next().ok_or(AppError::InvalidPager)?;
-    Ok(Command::new(program)
+    let mut command = Command::new(&program);
+    if Path::new(&program).file_name() == Some(OsStr::new("less")) {
+        // Wide output is paged so it can be shown unwrapped, so chop long lines
+        // whatever $LESS says. Arguments in the pager command come later and
+        // can still turn it off with -+S.
+        command.arg("-S");
+    }
+    Ok(command
         .args(parts)
-        .env("LESS", env::var("LESS").unwrap_or_else(|_| "-SRFX".into()))
+        .env("LESS", env::var("LESS").unwrap_or_else(|_| "-FX".into()))
         .stdin(Stdio::piped())
         .spawn()?)
 }
@@ -605,6 +628,14 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
+        }
+    }
+
+    /// A screen as wide as any output, so only height decides paging.
+    fn tall(lines: usize) -> Screen {
+        Screen {
+            lines,
+            columns: usize::MAX,
         }
     }
 
@@ -774,7 +805,7 @@ mod tests {
         write_stream_to_pager(
             stream("data".into()),
             "sh -c 'cat >/dev/null'",
-            0,
+            tall(0),
             write_stdout,
             write_diagnostic,
         )
@@ -783,7 +814,7 @@ mod tests {
         let error = write_stream_to_pager(
             stream("data".into()),
             "sh -c 'cat >/dev/null; exit 7'",
-            0,
+            tall(0),
             write_stdout,
             write_diagnostic,
         )
@@ -795,7 +826,7 @@ mod tests {
         let error = write_stream_to_pager(
             stream("x".repeat(1 << 20)),
             "sh -c 'exit 0'",
-            0,
+            tall(0),
             write_stdout,
             write_diagnostic,
         )
@@ -807,7 +838,7 @@ mod tests {
         let error = write_stream_to_pager(
             stream("x".repeat(1 << 20)),
             "sh -c 'exit 7'",
-            0,
+            tall(0),
             write_stdout,
             write_diagnostic,
         )
@@ -831,7 +862,7 @@ mod tests {
         let error = write_stream_to_pager(
             receiver,
             "'",
-            1,
+            tall(1),
             |data| {
                 seen.borrow_mut().push(format!("out:{data}"));
                 Ok(())
@@ -872,7 +903,7 @@ mod tests {
         write_stream_to_pager(
             receiver,
             "sh -c 'exit 7'",
-            10,
+            tall(10),
             |data| {
                 seen.borrow_mut().push(format!("out:{data}"));
                 Ok(())
@@ -908,12 +939,56 @@ mod tests {
         let error = write_stream_to_pager(
             receiver,
             "sh -c 'cat >/dev/null; exit 7'",
-            3,
+            tall(3),
             write_stdout,
             write_diagnostic,
         )
         .unwrap_err();
         assert!(matches!(error, AppError::PagerExit(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_single_line_wider_than_the_screen_opens_the_pager() {
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .blocking_send(StreamOutput::Data("a wide row\n".into()))
+            .unwrap();
+        drop(sender);
+        let screen = Screen {
+            lines: 24,
+            columns: 5,
+        };
+        let error = write_stream_to_pager(
+            receiver,
+            "sh -c 'cat >/dev/null; exit 7'",
+            screen,
+            write_stdout,
+            write_diagnostic,
+        )
+        .unwrap_err();
+        assert!(matches!(error, AppError::PagerExit(_)));
+    }
+
+    #[test]
+    fn width_is_measured_in_terminal_columns() {
+        let screen = Screen {
+            lines: 24,
+            columns: 4,
+        };
+        assert!(!screen.too_narrow_for("ab\n日本\n"));
+        assert!(screen.too_narrow_for("ab\n日本語\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn less_always_chops_long_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let less = dir.path().join("less");
+        std::fs::write(&less, "#!/bin/sh\ncat >/dev/null\n[ \"$*\" = '-S -R' ]\n").unwrap();
+        std::fs::set_permissions(&less, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        page_with_command("output", &format!("{} -R", less.display())).unwrap();
     }
 
     #[cfg(unix)]
@@ -934,7 +1009,7 @@ mod tests {
         // then would find no marker.
         let pager = format!("sh -c 'cat >/dev/null; touch {}'", marker.display());
         let mut seen = Vec::new();
-        write_stream_to_pager(receiver, &pager, 0, write_stdout, |diagnostic| {
+        write_stream_to_pager(receiver, &pager, tall(0), write_stdout, |diagnostic| {
             assert!(
                 marker.exists(),
                 "diagnostic written while the pager was running"
