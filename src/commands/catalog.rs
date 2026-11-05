@@ -437,8 +437,9 @@ ORDER BY pg_catalog.array_position($1, a.attrelid), a.attnum
 const DESCRIBE_CONSTRAINTS: &str = r#"
 SELECT conrelid, conname::text AS "Name", pg_get_constraintdef(oid, true)::text AS "Definition"
 FROM pg_catalog.pg_constraint
--- PostgreSQL 18 records NOT NULL as constraints; the Nullable column already shows them.
-WHERE conrelid = ANY($1) AND contype <> 'n'
+-- PostgreSQL 18 records NOT NULL as constraints. Show only those the Nullable
+-- column cannot express.
+WHERE conrelid = ANY($1) AND (contype <> 'n' OR NOT convalidated OR connoinherit)
 ORDER BY pg_catalog.array_position($1, conrelid), conname
 "#;
 
@@ -456,14 +457,18 @@ WHERE i.indrelid = ANY($1)
 ORDER BY pg_catalog.array_position($1, i.indrelid), c.relname
 "#;
 
-// conparentid = 0 skips the copies PostgreSQL makes for each partition of a
-// partitioned table, as psql does.
+// Like psql, a partition lists the foreign keys that reference its ancestors,
+// and conparentid = 0 skips the copies PostgreSQL makes for each partition.
+// pg_partition_ancestors returns nothing for ordinary tables.
 const DESCRIBE_REFERENCED_BY: &str = r#"
-SELECT confrelid, conrelid::regclass::text AS "Table", conname::text AS "Name",
-       pg_get_constraintdef(oid, true)::text AS "Definition"
-FROM pg_catalog.pg_constraint
-WHERE confrelid = ANY($1) AND contype = 'f' AND conparentid = 0
-ORDER BY pg_catalog.array_position($1, confrelid), conrelid::regclass::text, conname
+SELECT r.oid, c.conrelid::regclass::text AS "Table", c.conname::text AS "Name",
+       pg_get_constraintdef(c.oid, true)::text AS "Definition"
+FROM unnest($1::oid[]) AS r(oid)
+JOIN pg_catalog.pg_constraint c
+  ON c.confrelid = r.oid
+  OR c.confrelid IN (SELECT relid FROM pg_catalog.pg_partition_ancestors(r.oid))
+WHERE c.contype = 'f' AND c.conparentid = 0
+ORDER BY pg_catalog.array_position($1, r.oid), "Table", c.conname
 "#;
 
 const DESCRIBE_DETAILS: &str = r#"
@@ -637,6 +642,11 @@ mod tests {
                     one_ref text CONSTRAINT pgline_two_one_fk \
                       REFERENCES pgline_batch_describe_one); \
                  CREATE INDEX pgline_two_index ON pgline_batch_describe_two (two_marker); \
+                 CREATE TEMP TABLE pgline_parted (id int PRIMARY KEY) PARTITION BY RANGE (id); \
+                 CREATE TEMP TABLE pgline_parted_leaf PARTITION OF pgline_parted \
+                   FOR VALUES FROM (0) TO (10); \
+                 CREATE TEMP TABLE pgline_parted_ref \
+                   (parted_id int CONSTRAINT pgline_parted_ref_fk REFERENCES pgline_parted); \
                  CREATE TEMP VIEW pgline_batch_describe_view AS \
                    SELECT one_marker AS view_marker FROM pgline_batch_describe_one",
             )
@@ -665,7 +675,7 @@ mod tests {
         let two = &rendered[two_start..view_start];
         let view = &rendered[view_start..];
         assert!(one.contains("one_marker"));
-        assert!(one.contains("pgline_batch_describe_one_pkey"));
+        assert!(one.contains("PRIMARY KEY (one_marker)"));
         assert!(!one.contains("_not_null"));
         assert!(!one.contains("Indexes:"));
         assert!(one.contains("Referenced by:"));
@@ -679,10 +689,70 @@ mod tests {
         assert!(view.contains("view_marker"));
         assert!(view.contains("View definition:"));
 
+        let leaf = run(
+            &database.client,
+            &CatalogCommand::Describe {
+                pattern: Some("pgline_parted_leaf".into()),
+                verbose: false,
+            },
+            CatalogLimits {
+                row_limit: 1000,
+                max_field_width: 500,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(leaf.contains("pgline_parted_ref_fk"));
+
         database
             .client
             .batch_execute("SET standard_conforming_strings = on")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires PGLINE_TEST_URL"]
+    async fn describe_keeps_not_null_constraints_the_nullable_column_cannot_show() {
+        let database = crate::test_support::connect().await;
+        let version: i32 = database
+            .client
+            .query_one("SELECT current_setting('server_version_num')::int", &[])
+            .await
+            .unwrap()
+            .get(0);
+        // NOT VALID and NO INHERIT NOT NULL constraints are new in PostgreSQL 18.
+        if version < 180000 {
+            return;
+        }
+        database
+            .client
+            .batch_execute(
+                "CREATE TEMP TABLE pgline_not_null \
+                   (plain int NOT NULL, \
+                    unchecked int, \
+                    uninherited int CONSTRAINT pgline_uninherited NOT NULL NO INHERIT); \
+                 INSERT INTO pgline_not_null VALUES (1, NULL, 1); \
+                 ALTER TABLE pgline_not_null \
+                   ADD CONSTRAINT pgline_unchecked NOT NULL unchecked NOT VALID",
+            )
+            .await
+            .unwrap();
+        let rendered = run(
+            &database.client,
+            &CatalogCommand::Describe {
+                pattern: Some("pgline_not_null".into()),
+                verbose: false,
+            },
+            CatalogLimits {
+                row_limit: 1000,
+                max_field_width: 500,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!rendered.contains("pgline_not_null_plain_not_null"));
+        assert!(rendered.contains("pgline_unchecked"));
+        assert!(rendered.contains("pgline_uninherited"));
     }
 }
