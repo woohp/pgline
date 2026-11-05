@@ -30,10 +30,15 @@ async fn main() {
         ) {
             return;
         }
+        // Server errors already start with their severity, as in psql.
+        let prefix = match &error {
+            crate::error::AppError::Postgres(error) if error.as_db_error().is_some() => "",
+            _ => "error: ",
+        };
         let _ = writeln!(
             std::io::stderr().lock(),
-            "error: {}",
-            output::safe_terminal_text(&error.to_string())
+            "{prefix}{}",
+            output::safe_terminal_lines(&error.to_string())
         );
         std::process::exit(1);
     }

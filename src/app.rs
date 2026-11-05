@@ -167,10 +167,7 @@ impl App {
                             if is_catalog {
                                 self.note_catalog_failure();
                             }
-                            eprintln!(
-                                "PostgreSQL error: {}",
-                                output::safe_terminal_text(&db_error.to_string())
-                            );
+                            eprintln!("{}", output::safe_terminal_lines(&db_error.to_string()));
                         }
                     }
                 }
@@ -511,7 +508,7 @@ impl App {
 /// one-shot run, or an unrecoverable failure, ends the process instead.
 fn report_or_fail(mode: Mode, error: AppError, recoverable: bool) -> Result<()> {
     if mode == Mode::Repl && recoverable {
-        eprintln!("{}", output::safe_terminal_text(&error.to_string()));
+        eprintln!("{}", output::safe_terminal_lines(&error.to_string()));
         return Ok(());
     }
     Err(error)

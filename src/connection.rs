@@ -331,7 +331,7 @@ async fn drive_connection<S, T>(
             Some(Err(error)) => {
                 eprintln!(
                     "PostgreSQL connection closed: {}",
-                    output::safe_terminal_text(&error.to_string())
+                    output::safe_terminal_lines(&crate::error::postgres_message(&error))
                 );
                 break;
             }
