@@ -1,6 +1,6 @@
 # pgline
 
-A PostgreSQL REPL
+A PostgreSQL REPL. Requires PostgreSQL 12 or later.
 
 ## Install
 
