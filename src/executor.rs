@@ -434,7 +434,7 @@ impl Canceller {
         tokio::select! {
             result = tokio::time::timeout(CANCEL_REQUEST_TIMEOUT, cancel) => match result {
                 Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(AppError::Cancellation(error.to_string())),
+                Ok(Err(error)) => Err(AppError::Cancellation(crate::error::postgres_message(&error))),
                 Err(_) => Err(AppError::Cancellation(format!(
                     "timed out after {} seconds",
                     CANCEL_REQUEST_TIMEOUT.as_secs()

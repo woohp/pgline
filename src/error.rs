@@ -2,7 +2,7 @@ use tokio_postgres::error::DbError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error("{}", postgres_message(.0))]
+    #[error("{}", display_postgres(.0))]
     Postgres(#[from] tokio_postgres::Error),
 
     #[error("I/O error: {0}")]
@@ -67,23 +67,27 @@ impl AppError {
             _ => None,
         }
     }
+}
 
-    /// Whether this is an error the server reported, whose message already
-    /// starts with its severity, such as `ERROR:` or `FATAL:`.
-    pub fn is_db_error(&self) -> bool {
-        matches!(self, AppError::Postgres(error) if error.as_db_error().is_some())
+/// Server errors already start with their severity, such as `ERROR:`.
+fn display_postgres(error: &tokio_postgres::Error) -> String {
+    let message = postgres_message(error);
+    if error.as_db_error().is_some() {
+        message
+    } else {
+        format!("PostgreSQL error: {message}")
     }
 }
 
 /// tokio-postgres displays every server error as just "db error" and leaves
 /// out the cause of client-side failures, so build the message from the parts.
-fn postgres_message(error: &tokio_postgres::Error) -> String {
+pub(crate) fn postgres_message(error: &tokio_postgres::Error) -> String {
     if let Some(db_error) = error.as_db_error() {
         return db_error.to_string();
     }
     match std::error::Error::source(error) {
-        Some(source) => format!("PostgreSQL error: {error}: {source}"),
-        None => format!("PostgreSQL error: {error}"),
+        Some(source) => format!("{error}: {source}"),
+        None => error.to_string(),
     }
 }
 
@@ -92,6 +96,17 @@ pub type Result<T> = std::result::Result<T, AppError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_errors_include_their_cause() {
+        let error = "port=notanumber"
+            .parse::<tokio_postgres::Config>()
+            .unwrap_err();
+        assert_eq!(
+            AppError::from(error).to_string(),
+            "PostgreSQL error: invalid connection string: invalid value for option `port`"
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires PGLINE_TEST_URL"]
@@ -105,10 +120,8 @@ mod tests {
             )
             .await
             .unwrap_err();
-        let error = AppError::from(error);
-        assert!(error.is_db_error());
         assert_eq!(
-            error.to_string(),
+            AppError::from(error).to_string(),
             "ERROR: duplicate key value violates unique constraint \"pgline_error_message_pkey\"\n\
              DETAIL: Key (id)=(1) already exists."
         );
