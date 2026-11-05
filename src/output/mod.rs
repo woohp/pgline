@@ -514,6 +514,16 @@ pub fn safe_terminal_text(value: &str) -> String {
     output
 }
 
+/// Like `safe_terminal_text`, but keeps line breaks, for multi-line messages
+/// such as a server error with DETAIL and HINT lines.
+pub fn safe_terminal_lines(value: &str) -> String {
+    value
+        .split('\n')
+        .map(safe_terminal_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(crate) fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -1135,6 +1145,14 @@ mod tests {
         let editor_safe = safe_editor_text(raw);
         assert_eq!(editor_safe.len(), raw.len());
         assert!(!editor_safe.contains(['\u{202e}', '\u{2067}', '\u{2069}']));
+    }
+
+    #[test]
+    fn multi_line_terminal_text_keeps_only_line_breaks() {
+        assert_eq!(
+            safe_terminal_lines("ERROR: bad\nDETAIL: \x1b[2Jworse\r"),
+            "ERROR: bad\nDETAIL: \\x1b[2Jworse\\r"
+        );
     }
 
     #[test]

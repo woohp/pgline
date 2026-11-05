@@ -30,10 +30,12 @@ async fn main() {
         ) {
             return;
         }
+        // Server errors already start with their severity, as in psql.
+        let prefix = if error.is_db_error() { "" } else { "error: " };
         let _ = writeln!(
             std::io::stderr().lock(),
-            "error: {}",
-            output::safe_terminal_text(&error.to_string())
+            "{prefix}{}",
+            output::safe_terminal_lines(&error.to_string())
         );
         std::process::exit(1);
     }
