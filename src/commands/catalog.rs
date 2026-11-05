@@ -138,6 +138,7 @@ struct RelationDetails {
     columns: HashMap<u32, ResultSet>,
     constraints: HashMap<u32, ResultSet>,
     indexes: HashMap<u32, ResultSet>,
+    referenced_by: HashMap<u32, ResultSet>,
     /// Storage and size columns, populated only for the `+` command forms.
     storage: HashMap<u32, ResultSet>,
 }
@@ -156,6 +157,7 @@ async fn load_relation_details(
     let columns = query_grouped_tables(client, &column_sql, &oids, limits).await?;
     let constraints = query_grouped_tables(client, DESCRIBE_CONSTRAINTS, &oids, limits).await?;
     let indexes = query_grouped_tables(client, DESCRIBE_INDEXES, &oids, limits).await?;
+    let referenced_by = query_grouped_tables(client, DESCRIBE_REFERENCED_BY, &oids, limits).await?;
     let storage = if verbose {
         query_grouped_tables(client, DESCRIBE_DETAILS, &oids, limits).await?
     } else {
@@ -165,6 +167,7 @@ async fn load_relation_details(
         columns,
         constraints,
         indexes,
+        referenced_by,
         storage,
     })
 }
@@ -219,6 +222,12 @@ fn append_relation_description(
         rendered,
         "\nIndexes:\n",
         &take(&mut details.indexes),
+        row_limit,
+    );
+    append_optional_table(
+        rendered,
+        "\nReferenced by:\n",
+        &take(&mut details.referenced_by),
         row_limit,
     );
     if let Some(definition) = &relation.view_definition {
@@ -427,7 +436,9 @@ ORDER BY pg_catalog.array_position($1, a.attrelid), a.attnum
 
 const DESCRIBE_CONSTRAINTS: &str = r#"
 SELECT conrelid, conname::text AS "Name", pg_get_constraintdef(oid, true)::text AS "Definition"
-FROM pg_catalog.pg_constraint WHERE conrelid = ANY($1)
+FROM pg_catalog.pg_constraint
+-- PostgreSQL 18 records NOT NULL as constraints; the Nullable column already shows them.
+WHERE conrelid = ANY($1) AND contype <> 'n'
 ORDER BY pg_catalog.array_position($1, conrelid), conname
 "#;
 
@@ -436,7 +447,23 @@ SELECT i.indrelid, c.relname::text AS "Name", pg_get_indexdef(i.indexrelid)::tex
 FROM pg_catalog.pg_index i
 JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
 WHERE i.indrelid = ANY($1)
+  -- Indexes backing primary key, unique and exclusion constraints are already
+  -- listed under Constraints.
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint con
+    WHERE con.conindid = i.indexrelid AND con.contype IN ('p', 'u', 'x')
+  )
 ORDER BY pg_catalog.array_position($1, i.indrelid), c.relname
+"#;
+
+// conparentid = 0 skips the copies PostgreSQL makes for each partition of a
+// partitioned table, as psql does.
+const DESCRIBE_REFERENCED_BY: &str = r#"
+SELECT confrelid, conrelid::regclass::text AS "Table", conname::text AS "Name",
+       pg_get_constraintdef(oid, true)::text AS "Definition"
+FROM pg_catalog.pg_constraint
+WHERE confrelid = ANY($1) AND contype = 'f' AND conparentid = 0
+ORDER BY pg_catalog.array_position($1, confrelid), conrelid::regclass::text, conname
 "#;
 
 const DESCRIBE_DETAILS: &str = r#"
@@ -606,7 +633,10 @@ mod tests {
             .batch_execute(
                 "CREATE TEMP TABLE pgline_batch_describe_one (one_marker text PRIMARY KEY); \
                  CREATE TEMP TABLE pgline_batch_describe_two \
-                   (two_marker integer CONSTRAINT pgline_two_positive CHECK (two_marker > 0)); \
+                   (two_marker integer CONSTRAINT pgline_two_positive CHECK (two_marker > 0), \
+                    one_ref text CONSTRAINT pgline_two_one_fk \
+                      REFERENCES pgline_batch_describe_one); \
+                 CREATE INDEX pgline_two_index ON pgline_batch_describe_two (two_marker); \
                  CREATE TEMP VIEW pgline_batch_describe_view AS \
                    SELECT one_marker AS view_marker FROM pgline_batch_describe_one",
             )
@@ -625,19 +655,27 @@ mod tests {
         )
         .await
         .unwrap();
-        let one_start = rendered.find("pgline_batch_describe_one").unwrap();
-        let two_start = rendered.find("pgline_batch_describe_two").unwrap();
-        let view_start = rendered.find("pgline_batch_describe_view").unwrap();
+        // Match the header lines, since table two also appears in table
+        // one's "Referenced by" list.
+        let one_start = rendered.find("pgline_batch_describe_one\"\n").unwrap();
+        let two_start = rendered.find("pgline_batch_describe_two\"\n").unwrap();
+        let view_start = rendered.find("pgline_batch_describe_view\"\n").unwrap();
         assert!(one_start < two_start && two_start < view_start);
         let one = &rendered[one_start..two_start];
         let two = &rendered[two_start..view_start];
         let view = &rendered[view_start..];
         assert!(one.contains("one_marker"));
         assert!(one.contains("pgline_batch_describe_one_pkey"));
+        assert!(!one.contains("_not_null"));
+        assert!(!one.contains("Indexes:"));
+        assert!(one.contains("Referenced by:"));
+        assert!(one.contains("pgline_two_one_fk"));
         assert!(!one.contains("two_marker"));
         assert!(two.contains("two_marker"));
         assert!(two.contains("pgline_two_positive"));
-        assert!(!two.contains("one_marker"));
+        assert!(two.contains("pgline_two_index"));
+        assert!(!two.contains("Referenced by:"));
+        assert!(!two.contains("pgline_batch_describe_one_pkey"));
         assert!(view.contains("view_marker"));
         assert!(view.contains("View definition:"));
 
